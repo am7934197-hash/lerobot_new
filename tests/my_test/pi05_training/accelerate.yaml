@@ -1,0 +1,134 @@
+# ============================================================================
+# accelerate 训练配置文件
+# 用法: accelerate launch --config_file accelerate.yaml -m lerobot.scripts.lerobot_train --config xxx.yaml
+# ============================================================================
+
+# ---- 计算环境 ----
+# LOCAL_MACHINE = 单机训练
+# AMAZON_SAGEMAKER = AWS SageMaker
+compute_environment: LOCAL_MACHINE
+
+# ---- 分布式类型 ----
+# NO           = 单卡 / CPU
+# MULTI_GPU    = 单机多卡 DDP
+# MULTI_CPU    = 单机多 CPU
+# MULTI_NPU    = 华为昇腾 NPU 多卡
+# MULTI_MLU    = 寒武纪 MLU 多卡
+# MULTI_MUSA   = 摩尔线程 MUSA 多卡
+# MULTI_XPU    = Intel XPU 多卡
+# DEEPSPEED    = Microsoft DeepSpeed（需下方 deepspeed_config）
+# FSDP         = PyTorch FSDP（需下方 fsdp_config）
+# MEGATRON_LM  = NVIDIA Megatron-LM（需下方 megatron_lm_config）
+# XLA          = TPU
+# MULTI_HPU    = Habana HPU 多卡
+# MULTI_NEURON = AWS Trainium/Neuron
+distributed_type: MULTI_GPU
+
+# ---- 混合精度 ----
+# no   = 全精度 float32（显存最大，最稳定）
+# fp16 = 半精度 float16（省 ~40% 显存，需 NVIDIA V100+，自动 loss scaling）
+# bf16 = bfloat16（省 ~40% 显存，数值范围同 fp32，A100/H100/B200/RTX4090）
+# fp8  = 8-bit 浮点（H100/B200 支持，需 fp8_config）
+mixed_precision: bf16
+
+# ---- 是否使用 CPU 训练 ----
+use_cpu: false
+
+# ---- Debug 模式（输出更详细日志） ----
+debug: false
+
+# ---- 进程 / GPU 数量 ----
+# 每个进程独占一张 GPU，通常与 CUDA_VISIBLE_DEVICES 的 GPU 数量一致
+num_processes: 1
+
+# ---- 多机配置（单机训练保持默认） ----
+# 总机器数
+num_machines: 1
+# 当前机器编号（0 起始，多机时每台递增）
+machine_rank: 0
+# 主节点 IP（多机必填，单机 null 即可）
+main_process_ip: null
+# 主节点端口（多机必填，单机 null 即可）
+main_process_port: null
+# 所有节点是否在同一网络（一般 false）
+same_network: true
+
+# ---- GPU 选择 ----
+# "all" = 自动使用 CUDA_VISIBLE_DEVICES 中的所有 GPU
+# "0,1,3" = 只使用指定编号的 GPU
+gpu_ids: all
+
+# ---- rendezvous 后端（分布式进程发现机制） ----
+# static = 静态指定 IP/Port，适合单机和已知 IP 的多机
+# c10d   = PyTorch c10d 后端
+# etcd / etcd-v2 = 基于 etcd 的服务发现
+rdzv_backend: static
+
+# ---- 训练入口函数名（一般为 "main"，无需修改） ----
+main_training_function: main
+
+# ---- CPU 亲和性绑定（绑定进程到固定 CPU 核，可能提升性能） ----
+enable_cpu_affinity: false
+
+# ---- bfloat16 降级 ----
+# 对不支持 bf16 的 op 自动降级为 fp32（一般设为 false）
+downcast_bf16: false
+
+# ---- TPU 相关（GPU 训练忽略） ----
+tpu_use_cluster: false
+tpu_use_sudo: false
+
+# ============================================================================
+# Torch Dynamo 编译（torch.compile，加速训练推理）
+# 可选值: "no" | "default" | "eager" | "aot_eager" | "inductor" | "max-autotune" 等
+# ============================================================================
+dynamo_config:
+  # dynamo_backend: inductor
+
+# ============================================================================
+# DeepSpeed 配置（仅 distributed_type: DEEPSPEED 时生效，示例）
+# ============================================================================
+# deepspeed_config:
+#   gradient_accumulation_steps: 1   # 梯度累积步数
+#   gradient_clipping: 1.0           # 梯度裁剪
+#   zero_stage: 2                    # ZeRO 阶段: 0 | 1 | 2 | 3
+#   offload_optimizer_device: none   # none | cpu | nvme
+#   offload_param_device: none       # none | cpu | nvme
+#   zero3_init_flag: true
+#   zero3_save_16bit_model: false
+
+# ============================================================================
+# FSDP 配置（仅 distributed_type: FSDP 时生效，示例）
+# ============================================================================
+# fsdp_config:
+#   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP  # 或 SIZE_BASED_WRAP / NO_WRAP
+#   fsdp_transformer_layer_cls_to_wrap: PaligemmaDecoderLayer
+#   fsdp_backward_prefetch: BACKWARD_PRE        # BACKWARD_PRE | BACKWARD_POST | NO_PREFETCH
+#   fsdp_forward_prefetch: false
+#   fsdp_use_orig_params: true
+#   fsdp_offload_params: false
+#   fsdp_sharding_strategy: 1                   # 1=FULL_SHARD | 2=SHARD_GRAD_OP | 3=NO_SHARD | 4=HYBRID_SHARD | 5=_HYBRID_SHARD_ZERO2
+#   fsdp_cpu_ram_efficient_loading: true
+#   fsdp_sync_module_states: true
+#   fsdp_state_dict_type: SHARDED_STATE_DICT
+
+# ============================================================================
+# Megatron-LM 配置（仅 distributed_type: MEGATRON_LM 时生效，示例）
+# ============================================================================
+# megatron_lm_config:
+#   tensor_model_parallel_size: 1
+#   pipeline_model_parallel_size: 1
+
+# ============================================================================
+# FP8 训练配置（仅 mixed_precision: fp8 时生效，示例）
+# ============================================================================
+# fp8_config:
+#   amax_history_len: 1024
+#   amax_compute_algo: max
+
+# ============================================================================
+# Tensor/Pipeline 并行配置（实验性）
+# ============================================================================
+# parallelism_config:
+#   tensor_parallel_size: 1
+#   pipeline_parallel_size: 1

@@ -1,0 +1,1 @@
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=3 python -m lerobot.async_inference.policy_server  --host=0.0.0.0 --port=18006 --fps=30

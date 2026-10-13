@@ -1,0 +1,28 @@
+# SwanLab 训练测试配置
+dataset:
+  repo_id: lerobot/svla_so101_pickplace
+  
+policy:
+  type: pi05
+  pretrained_path: null
+  push_to_hub: false  # 不上传到 HuggingFace Hub
+  device: cuda  # 指定使用 CUDA
+  # use_amp: true  # 启用混合精度训练以节省显存
+  gradient_checkpointing: true  # 启用梯度检查点以节省显存
+  
+output_dir: null  # 留空则自动生成带时间戳的目录
+job_name: pi05_swanlab_test
+seed: 42
+resume: false
+
+batch_size: 16  # 每张 GPU 的 batch size（多卡训练时适当减小）
+# gradient_accumulation_steps: 2  # 梯度累计步数，有效 batch size = batch_size * num_gpus * gradient_accumulation_steps
+steps: 1000
+log_freq: 50
+save_freq: 500
+
+wandb:
+  enable: true
+  backend: swanlab
+  project: lerobot-pi05-test
+  mode: online

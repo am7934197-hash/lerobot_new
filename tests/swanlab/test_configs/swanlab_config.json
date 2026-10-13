@@ -1,0 +1,13 @@
+{
+    "_comment": "Configuration for testing SwanLab backend",
+    "wandb": {
+        "enable": true,
+        "backend": "swanlab",
+        "project": "lerobot_test",
+        "entity": null,
+        "mode": "offline",
+        "add_tags": true,
+        "disable_artifact": false,
+        "notes": "Testing SwanLab backend integration"
+    }
+}

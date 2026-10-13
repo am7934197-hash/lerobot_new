@@ -1,0 +1,126 @@
+# ============================================================================
+# PI05 + SwanLab 训练配置（Delta Action / Relative Action）
+# ============================================================================
+# 与 pi05_test_swanlab_config.yaml 的唯一区别：
+#   use_relative_actions: true  ← 启用相对动作训练
+#   训练前建议先执行 recompute_relative_stats.py 重算数据集统计量
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 数据集
+# ---------------------------------------------------------------------------
+dataset:
+  repo_id: null
+  # 默认使用原始数据集。运行 recompute_relative_stats.py 后，改为：
+  root: /mnt/data2/dataset/data_jizheng/galbot_spray/spray_lerobotv3_all_index_relative_stats_50
+  # root: /mnt/data2/dataset/data_jizheng/galbot_spray/spray_0708/50003_71684_lerobotv3
+  episodes: null
+  # image_transforms:
+  #   enable: false
+  # use_imagenet_stats: true
+
+# ---------------------------------------------------------------------------
+# 策略模型（PI05 + Delta Action）
+# ---------------------------------------------------------------------------
+policy:
+  type: pi05
+
+  # ---- 模型架构 ----
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  dtype: bfloat16 #float32
+  image_resolution: [224, 224]
+
+  # ---- 观测 / 动作 ----
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 50
+  max_state_dim: 32
+  max_action_dim: 32
+
+  # ---- 归一化 ----
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+  # ---- 相对动作（核心区别） ----
+  use_relative_actions: true
+  # 在相对动作中保持为绝对值的关节名（默认 gripper 保持绝对）
+  relative_exclude_joints: ["gripper"]
+  # 动作特征名称列表（运行时自动填充）
+  # action_feature_names: null
+
+  # ---- Flow Matching ----
+  num_inference_steps: 10
+  time_sampling_beta_alpha: 1.5
+  time_sampling_beta_beta: 1.0
+  time_sampling_scale: 0.999
+  time_sampling_offset: 0.001
+  min_period: 0.004
+  max_period: 4.0
+
+  # ---- 编译优化 ----
+  compile_model: true
+  compile_mode: max-autotune
+
+  # ---- 冻结策略 ----
+  freeze_vision_encoder: false
+  train_expert_only: false
+
+  # ---- 优化器 ----
+  optimizer_lr: 2.5e-5
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-8
+  optimizer_weight_decay: 0.01
+  optimizer_grad_clip_norm: 1.0
+
+  # ---- 学习率调度 ----
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+  scheduler_decay_lr: 2.5e-6
+
+  # ---- 设备 / 精度 ----
+  device: cuda
+  use_amp: false
+  use_peft: false
+  gradient_checkpointing: true
+
+  # ---- Hub 相关 ----
+  pretrained_path: null
+  push_to_hub: false
+
+# ---------------------------------------------------------------------------
+# 输出与任务
+# ---------------------------------------------------------------------------
+output_dir: null
+job_name: pi05_swanlab_delta_test
+
+# ---------------------------------------------------------------------------
+# 训练通用参数
+# ---------------------------------------------------------------------------
+seed: 42
+resume: false
+cudnn_deterministic: false
+
+batch_size: 16
+num_workers: 8
+prefetch_factor: 8
+persistent_workers: true
+
+steps: 50000
+log_freq: 50
+eval_freq: 500
+save_freq: 10000
+save_checkpoint: true
+
+use_policy_training_preset: true
+
+# ---------------------------------------------------------------------------
+# SwanLab / WandB
+# ---------------------------------------------------------------------------
+wandb:
+  enable: true
+  backend: swanlab
+  project: lerobot-pi05-painting
+  mode: online

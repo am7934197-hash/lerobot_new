@@ -1,0 +1,9 @@
+numpy==2.2.6
+opencv-python==4.10.0.84
+pandas==2.2.3
+pyarrow==19.0.0
+protobuf==5.29.3
+mcap==1.4.0
+av==15.1.0
+tqdm==4.67.1
+lerobot==0.4.4

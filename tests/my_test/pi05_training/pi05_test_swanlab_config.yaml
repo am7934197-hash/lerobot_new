@@ -1,0 +1,308 @@
+# ============================================================================
+# PI05 + SwanLab 训练配置（完整版）
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 数据集
+# ---------------------------------------------------------------------------
+dataset:
+  # HuggingFace Hub 上的数据集名称，为 null 则用本地 root 路径
+  repo_id: null
+  # repo_id: jizheng/pickup_top_hand_50_used
+  # 本地数据集根目录
+  # root: /mnt/data1/jizheng/vla_project/data/lerobot/lijiawei/lingshou/galbot_mcap_lerobot
+  root: /mnt/data2/dataset/data_jizheng/galbot_spray/spray_0708/50003_71684_lerobotv3
+  # 可选：限定只加载特定的 episode index 列表
+  episodes: null #  [0, 2, 5]
+  # HuggingFace Hub revision（branch/tag/commit）
+  # revision: null
+  # 图像增强配置（默认禁用，可用下方 image_transforms 配置开启）
+  # image_transforms:
+  #   enable: false
+  # 是否使用 ImageNet 均值/标准差做归一化
+  # use_imagenet_stats: true
+  # 视频解码后端（默认自动选择 torchcodec > pyav）
+  # video_backend: torchcodec
+  # 返回 uint8 而非 float32 以降低 DataLoader IPC 开销
+  # return_uint8: false
+  # 是否以 streaming 模式加载（不下载到本地）
+  # streaming: false
+
+# ---------------------------------------------------------------------------
+# 图像增强（dataset.image_transforms 展开写在这里）
+# ---------------------------------------------------------------------------
+# image_transforms:
+#   enable: true
+#   max_num_transforms: 3
+#   random_order: false
+#   tfs:
+#     brightness:
+#       type: ColorJitter
+#       weight: 1.0
+#       kwargs:
+#         brightness: [0.8, 1.2]
+#     contrast:
+#       type: ColorJitter
+#       weight: 1.0
+#       kwargs:
+#         contrast: [0.8, 1.2]
+#     saturation:
+#       type: ColorJitter
+#       weight: 1.0
+#       kwargs:
+#         saturation: [0.5, 1.5]
+#     hue:
+#       type: ColorJitter
+#       weight: 1.0
+#       kwargs:
+#         hue: [-0.05, 0.05]
+#     sharpness:
+#       type: SharpnessJitter
+#       weight: 1.0
+#       kwargs:
+#         sharpness: [0.5, 1.5]
+#     affine:
+#       type: RandomAffine
+#       weight: 1.0
+#       kwargs:
+#         degrees: [-5.0, 5.0]
+#         translate: [0.05, 0.05]
+
+# ---------------------------------------------------------------------------
+# 策略模型（PI05）
+# ---------------------------------------------------------------------------
+policy:
+  type: pi05
+
+  # ---- 模型架构 ----
+  # VLM 骨干变体: gemma_2b
+  paligemma_variant: gemma_2b
+  # 动作专家变体: gemma_300m
+  action_expert_variant: gemma_300m
+  # 模型精度: float32 | bfloat16
+  dtype: bfloat16 #float32
+  # 输入图像分辨率
+  image_resolution: [224, 224]
+  # 没有图像特征时添加的空摄像头数量
+  # empty_cameras: 0
+  # Tokenizer 最大序列长度
+  # tokenizer_max_length: 200
+
+  # ---- 观测 / 动作 ----
+  # 观测步数
+  n_obs_steps: 1
+  # 预测的动作块大小（action horizon）
+  chunk_size: 50
+  # 执行的动作步数
+  n_action_steps: 50
+  # 状态向量最大维度（短向量会 pad 到此维度）
+  max_state_dim: 32
+  # 动作向量最大维度
+  max_action_dim: 32
+  # 输入特征描述（运行时自动从数据集推断）
+  # input_features: {}
+  # 输出特征描述（运行时自动从数据集推断）
+  # output_features: {}
+
+  # ---- 归一化 ----
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+  # ---- 相对动作 ----
+  use_relative_actions: false
+  # 在相对动作中保持为绝对值的关节名
+  # relative_exclude_joints: ["gripper"]
+  # 动作特征名称列表（运行时自动填充）
+  # action_feature_names: null
+
+  # ---- Flow Matching ----
+  num_inference_steps: 10
+  # Beta 分布采样参数
+  time_sampling_beta_alpha: 1.5
+  time_sampling_beta_beta: 1.0
+  time_sampling_scale: 0.999
+  time_sampling_offset: 0.001
+  min_period: 0.004
+  max_period: 4.0
+
+  # ---- 编译优化 ----
+  compile_model: false
+  # compile 模式: "max-autotune" | "default" | "reduce-overhead" 等
+  compile_mode: max-autotune
+
+  # ---- 冻结策略 ----
+  freeze_vision_encoder: false
+  # 冻结整个 VLM，仅训练动作专家和投影层
+  train_expert_only: false
+
+  # ---- 优化器（策略内置默认值，use_policy_training_preset=true 时自动覆盖全局 optimizer/scheduler） ----
+  optimizer_lr: 2.5e-5          # AdamW 峰值学习率
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-8
+  optimizer_weight_decay: 0.01
+  optimizer_grad_clip_norm: 1.0
+
+  # ---- 学习率调度（策略内置默认值，use_policy_training_preset=true 时生效） ----
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+  scheduler_decay_lr: 2.5e-6
+
+  # ---- Real-Time Chunking（可选） ----
+  # rtc_config: null
+
+  # ---- 设备 / 精度 ----
+  device: cuda
+  # 启用 AMP 混合精度（bfloat16 自动）
+  use_amp: false
+  # 启用 PEFT（参数高效微调）
+  use_peft: false
+  # 梯度检查点（省显存）
+  gradient_checkpointing: true
+
+  # ---- Hub 相关 ----
+  # 预训练权重路径（null = 从头训练）
+  pretrained_path: null
+  # 是否推送到 HuggingFace Hub
+  push_to_hub: false
+  # Hub repo ID
+  # repo_id: null
+  # 是否设为私有仓库
+  # private: null
+  # 标签列表
+  # tags: null
+  # 开源协议
+  # license: null
+
+# ---------------------------------------------------------------------------
+# 强化学习环境（可选，仅 distillation / RL 场景）
+# ---------------------------------------------------------------------------
+# env: null
+
+# ---------------------------------------------------------------------------
+# 奖励模型（可选）
+# ---------------------------------------------------------------------------
+# reward_model: null
+
+# ---------------------------------------------------------------------------
+# 输出与任务
+# ---------------------------------------------------------------------------
+# 输出目录，null 则自动生成 outputs/train/YYYY-MM-DD/HH-MM-SS_<job_name>
+output_dir: null
+# 任务名
+job_name: pi05_swanlab_test
+
+# ---------------------------------------------------------------------------
+# 训练通用参数
+# ---------------------------------------------------------------------------
+# 随机种子（训练 + 评估都用这个）
+seed: 42
+# 是否从 checkpoint 恢复训练
+resume: false
+# 是否使用确定性 cuDNN（牺牲速度换可复现性，约慢 10-20%）
+cudnn_deterministic: false
+
+# 每张 GPU 的 batch size
+batch_size: 16
+# DataLoader 工作进程数
+num_workers: 8
+# DataLoader 预取系数
+prefetch_factor: 8
+# 是否保持 DataLoader worker 常驻
+persistent_workers: true
+
+# 总训练步数
+steps: 10000
+# 每 N 步记录一次日志
+log_freq: 50
+# 每 N 步评估一次
+eval_freq: 5000
+# 每 N 步保存一次 checkpoint
+save_freq: 5000
+# 是否保存 checkpoint
+save_checkpoint: true
+# 时间戳容差（秒），用于调试
+# tolerance_s: 0.0001
+
+# 是否使用策略内置的训练预设（自动覆盖 optimizer / scheduler 配置）
+use_policy_training_preset: true
+
+# ---------------------------------------------------------------------------
+# 优化器（仅 use_policy_training_preset=false 时生效）
+# ---------------------------------------------------------------------------
+# optimizer:
+#   type: adamw              # adam | adamw | sgd | xvla-adamw | multi_adam
+#   lr: 1.0e-3
+#   betas: [0.9, 0.999]
+#   eps: 1.0e-8
+#   weight_decay: 0.01
+#   grad_clip_norm: 10.0
+#   # SGD 专用:
+#   # momentum: 0.0
+#   # dampening: 0.0
+#   # nesterov: false
+
+# ---------------------------------------------------------------------------
+# 学习率调度器（仅 use_policy_training_preset=false 时生效）
+# ---------------------------------------------------------------------------
+# scheduler:
+#   type: cosine_decay_with_warmup   # diffuser | vqbet | cosine_decay_with_warmup
+#   num_warmup_steps: 1000
+#   num_decay_steps: 30000
+#   peak_lr: 2.5e-5
+#   decay_lr: 2.5e-6
+#   # diffuser 专用:
+#   # name: cosine           # linear | cosine | cosine_with_restarts | polynomial | constant | constant_with_warmup
+#   # vqbet 专用:
+#   # num_vqvae_training_steps: 0
+#   # num_cycles: 0.5
+
+# ---------------------------------------------------------------------------
+# PEFT（参数高效微调）
+# ---------------------------------------------------------------------------
+# peft:
+#   type: LORA               # 默认 LORA
+#   method_type: LORA
+#   r: 16                    # LoRA rank
+#   lora_alpha: null         # LoRA alpha（null = PEFT 库默认 8）
+#   target_modules: null     # 目标模块名后缀 或 "all-linear"
+#   full_training_modules: null
+#   init_type: null
+
+# ---------------------------------------------------------------------------
+# 样本加权
+# ---------------------------------------------------------------------------
+# sample_weighting:
+#   type: rabc                # rabc
+#   progress_path: null
+#   kappa: 1.0
+#   epsilon: 0.01
+#   head_mode: null
+
+# ---------------------------------------------------------------------------
+# 评估配置
+# ---------------------------------------------------------------------------
+# eval:
+#   n_episodes: 50           # 评估 episode 数
+#   batch_size: 0            # 0 = 自动根据 CPU 核数和 n_episodes 调整
+#   use_async_envs: true     # 是否使用异步环境（多进程）
+
+# ---------------------------------------------------------------------------
+# SwanLab / WandB
+# ---------------------------------------------------------------------------
+wandb:
+  enable: true
+  backend: swanlab             # swanlab | wandb
+  project: lerobot-pi05-painting
+  # entity: null               # SwanLab: workspace; WandB: team/user
+  # notes: null                # 备注
+  # run_id: null               # 指定 run id 用于恢复
+  mode: online                 # online | offline | disabled
+  # add_tags: true             # 是否把配置作为 tags 保存
+  # disable_artifact: false    # 是否禁用 artifact 保存
+
+# ---------------------------------------------------------------------------
+# 特征键名重映射（用于加载 pretrained checkpoint 时适配不同数据集的特征键）
+# ---------------------------------------------------------------------------
+# rename_map: {}
