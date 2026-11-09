@@ -33,7 +33,7 @@ import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.configuration_rtc import RTCConfig, validate_trained_rtc_horizon
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import (
     NormalizerProcessorStep,
@@ -53,6 +53,8 @@ _RTC_IDLE_SLEEP_S: float = 0.01
 _RTC_ERROR_RETRY_DELAY_S: float = 0.5
 # Consecutive transient errors tolerated before giving up and propagating shutdown.
 _RTC_MAX_CONSECUTIVE_ERRORS: int = 10
+# Consecutive unusable trained-RTC chunks tolerated before stopping.
+_RTC_MAX_CONSECUTIVE_DISCARDS: int = 5
 # Hard timeout for joining the RTC thread on stop().
 _RTC_JOIN_TIMEOUT_S: float = 3.0
 
@@ -74,6 +76,52 @@ def _normalize_prev_actions_length(prev_actions: torch.Tensor, target_steps: int
     padded = torch.zeros((target_steps, action_dim), dtype=prev_actions.dtype, device=prev_actions.device)
     padded[:steps] = prev_actions
     return padded
+
+
+def _estimate_rtc_delay(
+    *,
+    latency: float,
+    time_per_step: float,
+    mode: str,
+    training_max_delay: int,
+    has_previous_actions: bool,
+) -> int:
+    """Estimate overlap, using trained capacity to bootstrap after warmup."""
+    if latency:
+        return math.ceil(latency / time_per_step)
+    if mode == "trained" and has_previous_actions:
+        return training_max_delay
+    return 0
+
+
+def _clamp_trained_rtc_delay(
+    *, conditioned_delay: int, available_steps: int, training_max_delay: int
+) -> int:
+    """Clamp the hard prefix to checkpoint support and available queued actions."""
+    clamped = min(conditioned_delay, training_max_delay, available_steps)
+    if clamped < conditioned_delay:
+        logger.warning(
+            "Trained RTC wanted a %d-step prefix but the checkpoint supports %d and the queue "
+            "holds %d actions; conditioning on %d.",
+            conditioned_delay,
+            training_max_delay,
+            available_steps,
+            clamped,
+        )
+    return clamped
+
+
+def _trained_rtc_chunk_can_merge(
+    *,
+    conditioned_delay: int,
+    measured_delay: int,
+    training_max_delay: int,
+    has_previous_actions: bool,
+) -> bool:
+    """Return whether the generated hard prefix covers the elapsed inference delay."""
+    if not has_previous_actions:
+        return True
+    return measured_delay <= training_max_delay and measured_delay <= conditioned_delay
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +166,18 @@ class RTCInferenceEngine(InferenceEngine):
         self._use_torch_compile = use_torch_compile
         self._compile_warmup_inferences = compile_warmup_inferences
         self._rtc_queue_threshold = rtc_queue_threshold
+
+        if rtc_config.mode == "trained":
+            training_max_delay = int(getattr(policy.config, "rtc_training_max_delay", 0))
+            prediction_steps = int(getattr(policy.config, "chunk_size", 0))
+            validate_trained_rtc_horizon(
+                rtc_config.execution_horizon, prediction_steps, training_max_delay
+            )
+            if rtc_queue_threshold < training_max_delay:
+                raise ValueError(
+                    f"Trained RTC queue_threshold ({rtc_queue_threshold}) must be at least "
+                    f"rtc_training_max_delay ({training_max_delay})."
+                )
 
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {}
@@ -254,6 +314,7 @@ class RTCInferenceEngine(InferenceEngine):
             warmup_required = max(1, self._compile_warmup_inferences) if self._use_torch_compile else 0
             inference_count = 0
             consecutive_errors = 0
+            consecutive_discards = 0
 
             while not self._shutdown_event.is_set():
                 if not self._policy_active.is_set():
@@ -273,8 +334,25 @@ class RTCInferenceEngine(InferenceEngine):
                         idx_before = queue.get_action_index()
                         prev_actions = queue.get_left_over()
 
+                        has_previous_actions = prev_actions is not None and prev_actions.numel() > 0
+                        training_max_delay = int(
+                            getattr(self._policy.config, "rtc_training_max_delay", 0)
+                        )
+
                         latency = latency_tracker.max()
-                        delay = math.ceil(latency / time_per_chunk) if latency else 0
+                        delay = _estimate_rtc_delay(
+                            latency=latency,
+                            time_per_step=time_per_chunk,
+                            mode=self._rtc_config.mode,
+                            training_max_delay=training_max_delay,
+                            has_previous_actions=has_previous_actions,
+                        )
+                        if self._rtc_config.mode == "trained" and delay > 0:
+                            delay = _clamp_trained_rtc_delay(
+                                conditioned_delay=delay,
+                                available_steps=0 if prev_actions is None else prev_actions.shape[0],
+                                training_max_delay=training_max_delay,
+                            )
 
                         obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
                         obs_batch = prepare_observation_for_inference(
@@ -299,10 +377,12 @@ class RTCInferenceEngine(InferenceEngine):
                                         policy_device=policy_device,
                                     )
 
-                        if prev_actions is not None:
+                        if has_previous_actions:
                             prev_actions = _normalize_prev_actions_length(
                                 prev_actions, target_steps=self._rtc_config.execution_horizon
                             )
+                        else:
+                            prev_actions = None
 
                         actions = self._policy.predict_action_chunk(
                             preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
@@ -320,6 +400,35 @@ class RTCInferenceEngine(InferenceEngine):
                             latency_tracker.reset()
                         else:
                             latency_tracker.add(new_latency)
+
+                        if (
+                            not is_warmup
+                            and self._rtc_config.mode == "trained"
+                            and not _trained_rtc_chunk_can_merge(
+                                conditioned_delay=delay,
+                                measured_delay=new_delay,
+                                training_max_delay=training_max_delay,
+                                has_previous_actions=has_previous_actions,
+                            )
+                        ):
+                            consecutive_discards += 1
+                            logger.warning(
+                                "Discarding trained RTC chunk (%d/%d): measured delay %d exceeded "
+                                "conditioned delay %d (checkpoint supports %d).",
+                                consecutive_discards,
+                                _RTC_MAX_CONSECUTIVE_DISCARDS,
+                                new_delay,
+                                delay,
+                                training_max_delay,
+                            )
+                            if consecutive_discards >= _RTC_MAX_CONSECUTIVE_DISCARDS:
+                                raise RuntimeError(
+                                    "Measured RTC delay stayed outside the trained range; retrain with "
+                                    "a larger rtc_training_max_delay, lower fps, or use guided RTC."
+                                )
+                            continue
+
+                        consecutive_discards = 0
 
                         queue.merge(original, processed, new_delay, idx_before)
 

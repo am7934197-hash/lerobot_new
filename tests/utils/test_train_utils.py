@@ -18,10 +18,15 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from lerobot.common.train_utils import (
+    get_best_checkpoint_dir,
+    get_best_checkpoint_window_start,
     get_step_checkpoint_dir,
     get_step_identifier,
+    is_best_checkpoint_candidate_step,
+    load_best_checkpoint_metadata,
     load_training_state,
     load_training_step,
+    save_best_checkpoint_metadata,
     save_checkpoint,
     save_training_state,
     save_training_step,
@@ -49,6 +54,39 @@ def test_get_step_checkpoint_dir():
     output_dir = Path("/checkpoints")
     step_dir = get_step_checkpoint_dir(output_dir, 1000, 5)
     assert step_dir == output_dir / CHECKPOINTS_DIR / "000005"
+
+
+def test_best_checkpoint_window_and_candidate_steps():
+    assert get_best_checkpoint_window_start(50_000, 5_000) == 45_000
+    assert is_best_checkpoint_candidate_step(45_000, 50_000, 5_000, 50)
+    assert is_best_checkpoint_candidate_step(45_050, 50_000, 5_000, 50)
+    assert is_best_checkpoint_candidate_step(50_000, 50_000, 5_000, 50)
+    assert not is_best_checkpoint_candidate_step(44_999, 50_000, 5_000, 50)
+    assert not is_best_checkpoint_candidate_step(45_001, 50_000, 5_000, 50)
+
+    # The final step is always considered even when it is off the regular cadence.
+    assert is_best_checkpoint_candidate_step(1_000, 1_000, 333, 50)
+
+
+def test_save_load_best_checkpoint_metadata(tmp_path):
+    checkpoint_dir = get_best_checkpoint_dir(tmp_path)
+    checkpoint_dir.mkdir(parents=True)
+    save_best_checkpoint_metadata(
+        checkpoint_dir,
+        step=47_350,
+        loss=0.0042,
+        total_steps=50_000,
+        window_start=45_000,
+        every_n_steps=50,
+    )
+
+    assert load_best_checkpoint_metadata(checkpoint_dir) == {
+        "step": 47_350,
+        "loss": 0.0042,
+        "total_steps": 50_000,
+        "window_start": 45_000,
+        "every_n_steps": 50,
+    }
 
 
 def test_save_load_training_step(tmp_path):

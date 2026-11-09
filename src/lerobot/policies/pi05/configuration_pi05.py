@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
+from numbers import Real
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -84,6 +86,13 @@ class PI05Config(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
+    # Maximum clean action-prefix length sampled during training. Zero disables
+    # training-time RTC and preserves the standard PI0.5 objective.
+    rtc_training_max_delay: int = 0
+    # Prefix lengths are sampled uniformly by default for backward compatibility.
+    # In weighted mode, one weight is required for every d in [0, max_delay].
+    rtc_training_sampling_mode: str = "uniform"
+    rtc_training_sampling_weights: list[float] | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
@@ -141,6 +150,45 @@ class PI05Config(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
 
+        if not 0 <= self.rtc_training_max_delay < self.chunk_size:
+            raise ValueError(
+                "rtc_training_max_delay must satisfy "
+                f"0 <= delay < chunk_size ({self.chunk_size}), got {self.rtc_training_max_delay}"
+            )
+
+        if self.rtc_training_sampling_mode not in {"uniform", "weighted"}:
+            raise ValueError(
+                "rtc_training_sampling_mode must be 'uniform' or 'weighted', "
+                f"got {self.rtc_training_sampling_mode!r}"
+            )
+
+        if self.rtc_training_sampling_mode == "weighted":
+            weights = self.rtc_training_sampling_weights
+            if weights is None:
+                raise ValueError(
+                    "rtc_training_sampling_weights must be provided when "
+                    "rtc_training_sampling_mode='weighted'"
+                )
+            expected_length = self.rtc_training_max_delay + 1
+            if len(weights) != expected_length:
+                raise ValueError(
+                    "rtc_training_sampling_weights must contain exactly "
+                    f"rtc_training_max_delay + 1 ({expected_length}) values, got {len(weights)}"
+                )
+            for index, weight in enumerate(weights):
+                if isinstance(weight, bool) or not isinstance(weight, Real):
+                    raise ValueError(
+                        "rtc_training_sampling_weights must contain finite, non-negative numbers; "
+                        f"weight for d={index} is {weight!r}"
+                    )
+                if not math.isfinite(float(weight)) or weight < 0:
+                    raise ValueError(
+                        "rtc_training_sampling_weights must contain finite, non-negative numbers; "
+                        f"weight for d={index} is {weight!r}"
+                    )
+            if math.fsum(float(weight) for weight in weights) <= 0:
+                raise ValueError("rtc_training_sampling_weights must have a sum greater than 0")
+
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
 
@@ -154,6 +202,19 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"state_dropout_prob must be between 0 and 1, got {self.state_dropout_prob}"
             )
+
+    def get_rtc_training_sampling_probabilities(self) -> list[float]:
+        """Return normalized probabilities for d=0..rtc_training_max_delay."""
+        num_delays = self.rtc_training_max_delay + 1
+        if self.rtc_training_sampling_mode == "uniform":
+            return [1.0 / num_delays] * num_delays
+
+        # Weighted configuration is validated in __post_init__.
+        weights = self.rtc_training_sampling_weights
+        if weights is None:  # pragma: no cover - defensive guard for mutated configs
+            raise ValueError("rtc_training_sampling_weights is required in weighted mode")
+        total = math.fsum(float(weight) for weight in weights)
+        return [float(weight) / total for weight in weights]
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

@@ -44,6 +44,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc import LatencyTracker, RTCConfig, RTCProcessor
+from lerobot.policies.rtc.configuration_rtc import validate_trained_rtc_horizon
 from lerobot.policies.rtc.relative import reanchor_relative_rtc_prefix
 from lerobot.processor import (
     NormalizerProcessorStep,
@@ -132,6 +133,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if raw_config:
             for key in (
                 "enabled",
+                "mode",
                 "execution_horizon",
                 "max_guidance_weight",
                 "prefix_attention_schedule",
@@ -211,10 +213,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.policy.init_rtc_processor()
             if self.rtc_config.enabled and not isinstance(self.policy.rtc_processor, RTCProcessor):
                 raise RuntimeError("Pi0.5 RTCProcessor was not initialized")
+            if self.rtc_config.enabled and self.rtc_config.mode == "trained":
+                validate_trained_rtc_horizon(
+                    self.rtc_config.execution_horizon,
+                    self.policy.config.chunk_size,
+                    self.policy.config.rtc_training_max_delay,
+                )
             self.logger.info(
-                "Pi0.5 RTC configured: enabled=%s mode=guided execution_horizon=%d "
+                "Pi0.5 RTC configured: enabled=%s mode=%s execution_horizon=%d "
                 "max_guidance_weight=%.3f prefix_attention_schedule=%s processor=%s",
                 self.rtc_config.enabled,
+                self.rtc_config.mode,
                 self.rtc_config.execution_horizon,
                 self.rtc_config.max_guidance_weight,
                 self.rtc_config.prefix_attention_schedule.value,
@@ -276,7 +285,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         handler_start = time.perf_counter()
         trace_id = self._trace_id(context)
         self.logger.info(
-            "SERVER TRACE trace_id=%s event=SERVER_REQUEST_RECEIVED perf_s=%.6f",
+            "服务端追踪：收到请求 trace_id=%s event=SERVER_REQUEST_RECEIVED perf_s=%.6f",
             trace_id,
             handler_start,
         )
@@ -295,7 +304,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         timed_observation.server_receive_ms = (decoded_at - handler_start) * 1000
         timed_observation.server_queue_enter_perf = decoded_at
         self.logger.info(
-            "SERVER TRACE trace_id=%s event=SERVER_OBSERVATION_DECODED perf_s=%.6f "
+            "服务端追踪：观测数据解码完成 trace_id=%s event=SERVER_OBSERVATION_DECODED perf_s=%.6f "
             "server_receive_ms=%.3f",
             trace_id,
             decoded_at,
@@ -372,10 +381,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             infer_done = time.perf_counter()
             inference_time = infer_done - infer_at
             self.logger.info(
-                "SERVER TRACE trace_id=%s event=SERVER_INFER_END perf_s=%.6f "
-                "server_model_infer_ms=%.3f prefix_frames_used=%d inference_delay_frames=%d",
+                "服务端追踪：本次推理完成 trace_id=%s event=SERVER_INFER_END perf_s=%.6f "
+                "本次模型推理耗时=%.3f毫秒 server_model_infer_ms=%.3f "
+                "prefix_frames_used=%d inference_delay_frames=%d",
                 trace_id,
                 infer_done,
+                stage_timing["server_model_infer_ms"],
                 stage_timing["server_model_infer_ms"],
                 action_chunk["prefix_frames_used"],
                 action_chunk["inference_delay_frames"],
@@ -624,13 +635,30 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         guidance_delay_frames = math.ceil(
             (elapsed_before_inference + predicted_remaining_latency) * request_fps
         )
+        conditioned_delay_frames = guidance_delay_frames
+        if self.rtc_config.mode == "trained" and rtc_prefix is not None:
+            training_max_delay = int(self.policy.config.rtc_training_max_delay)
+            conditioned_delay_frames = min(
+                guidance_delay_frames,
+                training_max_delay,
+                prefix_frames_used,
+            )
+            if conditioned_delay_frames < guidance_delay_frames:
+                self.logger.warning(
+                    "Clamped trained RTC prefix from %d to %d frames "
+                    "(checkpoint max=%d, available=%d)",
+                    guidance_delay_frames,
+                    conditioned_delay_frames,
+                    training_max_delay,
+                    prefix_frames_used,
+                )
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(
             observation,
             prev_chunk_left_over=rtc_prefix,
-            inference_delay=guidance_delay_frames,
+            inference_delay=conditioned_delay_frames,
         )
         # torch.compile CUDA graph replay is async — synchronize so inference timing
         # captures real GPU execution time and postprocessing timing is not inflated.
@@ -638,7 +666,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             torch.cuda.synchronize()
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
-            f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
+            "本次模型推理耗时：%.3f 毫秒，动作张量形状：%s",
+            inference_time * 1000,
+            tuple(action_tensor.shape),
         )
 
         """4. Apply postprocessor"""
@@ -678,11 +708,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         actual_delay_frames = math.ceil(
             max(0.0, postprocess_stops - request_start_perf) * request_fps
         )
+        if (
+            self.rtc_config.mode == "trained"
+            and rtc_prefix is not None
+            and actual_delay_frames > conditioned_delay_frames
+        ):
+            raise RuntimeError(
+                "Discarding trained RTC chunk because actual inference delay "
+                f"({actual_delay_frames}) exceeded its conditioned prefix "
+                f"({conditioned_delay_frames}); checkpoint supports "
+                f"rtc_training_max_delay={self.policy.config.rtc_training_max_delay}."
+            )
         response = {
             "trace_id": str(getattr(observation_t, "trace_id", "")),
             "observation_timestep": observation_t.get_timestep(),
             "inference_delay_frames": actual_delay_frames,
-            "guidance_delay_frames": guidance_delay_frames,
+            "guidance_delay_frames": conditioned_delay_frames,
             "prefix_frames_used": prefix_frames_used,
             "expired_prefix_frames": 0,
             "previous_action_start_index": int(

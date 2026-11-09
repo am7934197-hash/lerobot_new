@@ -48,6 +48,16 @@ class ActionErrorMetricsConfig:
     save_heatmap: bool = True
 
 
+@dataclass
+class BestCheckpointConfig:
+    """Keep the lowest-loss checkpoint from the final part of training."""
+
+    enabled: bool = False
+    window_steps: int = 5_000
+    # 0 uses TrainPipelineConfig.log_freq.
+    every_n_steps: int = 0
+
+
 def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None:
     """Return migrated payload for legacy RA-BC fields, or None when no migration is needed."""
     legacy_fields = (
@@ -124,6 +134,7 @@ class TrainPipelineConfig(HubMixin):
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     action_error_metrics: ActionErrorMetricsConfig = field(default_factory=ActionErrorMetricsConfig)
+    best_checkpoint: BestCheckpointConfig = field(default_factory=BestCheckpointConfig)
     peft: PeftConfig | None = None
 
     # Sample weighting configuration (e.g., for RA-BC training)
@@ -146,6 +157,18 @@ class TrainPipelineConfig(HubMixin):
         return self.policy  # type: ignore[return-value]
 
     def validate(self) -> None:
+        if self.best_checkpoint.enabled:
+            if not self.save_checkpoint:
+                raise ValueError("best_checkpoint.enabled requires save_checkpoint=true")
+            if self.best_checkpoint.window_steps <= 0:
+                raise ValueError("best_checkpoint.window_steps must be greater than 0")
+            if self.best_checkpoint.every_n_steps < 0:
+                raise ValueError("best_checkpoint.every_n_steps must be greater than or equal to 0")
+            if self.best_checkpoint.every_n_steps == 0 and self.log_freq <= 0:
+                raise ValueError(
+                    "best_checkpoint.every_n_steps must be set when log_freq is not greater than 0"
+                )
+
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         reward_model_path = parser.get_path_arg("reward_model")

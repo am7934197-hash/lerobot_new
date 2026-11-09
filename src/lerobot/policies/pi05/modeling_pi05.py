@@ -67,6 +67,169 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def _prepare_trained_rtc_prefix(
+    x_t: Tensor,
+    prev_chunk_left_over: Tensor | None,
+    inference_delay: int,
+    training_max_delay: int,
+) -> tuple[Tensor | None, Tensor | None]:
+    """Validate and pad a hard prefix for training-time RTC inference."""
+    if prev_chunk_left_over is None or inference_delay <= 0:
+        return None, None
+    if training_max_delay <= 0:
+        raise ValueError(
+            "RTC mode='trained' requires a checkpoint trained with policy.rtc_training_max_delay > 0."
+        )
+    if inference_delay > training_max_delay:
+        raise ValueError(
+            f"Measured RTC inference delay ({inference_delay}) exceeds the checkpoint's "
+            f"rtc_training_max_delay ({training_max_delay})."
+        )
+    if inference_delay >= x_t.shape[1]:
+        raise ValueError(
+            f"RTC inference delay ({inference_delay}) must be smaller than chunk_size ({x_t.shape[1]})."
+        )
+
+    previous = prev_chunk_left_over.to(device=x_t.device, dtype=x_t.dtype)
+    if not torch.isfinite(previous).all():
+        raise ValueError("RTC prefix contains NaN or Inf values.")
+    if previous.ndim == 2:
+        previous = previous.unsqueeze(0)
+    if previous.ndim != 3:
+        raise ValueError(f"Expected RTC prefix shape (B, T, A), got {tuple(previous.shape)}")
+    if previous.shape[0] == 1 and x_t.shape[0] > 1:
+        previous = previous.expand(x_t.shape[0], -1, -1)
+    if previous.shape[0] != x_t.shape[0]:
+        raise ValueError(
+            f"RTC prefix batch size ({previous.shape[0]}) does not match policy batch ({x_t.shape[0]})."
+        )
+    if previous.shape[1] < inference_delay:
+        raise ValueError(f"RTC prefix has {previous.shape[1]} steps, but inference_delay={inference_delay}.")
+    if previous.shape[2] > x_t.shape[2]:
+        raise ValueError(
+            f"RTC prefix action dimension ({previous.shape[2]}) exceeds model dimension ({x_t.shape[2]})."
+        )
+
+    padded_prefix = torch.zeros_like(x_t)
+    padded_prefix[:, :inference_delay, : previous.shape[2]] = previous[:, :inference_delay]
+    prefix_mask = torch.arange(x_t.shape[1], device=x_t.device) < inference_delay
+    prefix_mask = prefix_mask[None, :, None].expand(x_t.shape[0], -1, x_t.shape[2])
+    return padded_prefix, prefix_mask
+
+
+def _sample_training_rtc_prefix_lengths(
+    batch_size: int,
+    max_delay: int,
+    device: torch.device,
+    sampling_mode: str = "uniform",
+    sampling_weights: list[float] | None = None,
+) -> Tensor | None:
+    """Sample one RTC prefix length per example using the device's global RNG."""
+    if max_delay <= 0:
+        return None
+
+    if sampling_mode == "uniform":
+        # Keep this exact randint path for backward-compatible RNG behavior.
+        return torch.randint(0, max_delay + 1, (batch_size,), device=device)
+    if sampling_mode != "weighted":
+        raise ValueError(f"Unsupported RTC training sampling mode: {sampling_mode!r}")
+    if sampling_weights is None:
+        raise ValueError("RTC weighted sampling requires sampling_weights")
+
+    weights = torch.as_tensor(sampling_weights, dtype=torch.float32, device=device)
+    if weights.numel() != max_delay + 1:
+        raise ValueError(
+            f"RTC weighted sampling expected {max_delay + 1} weights, got {weights.numel()}"
+        )
+    probabilities = weights / weights.sum()
+    return torch.multinomial(probabilities, batch_size, replacement=True)
+
+
+def _sample_training_rtc_prefix(
+    batch_size: int,
+    action_horizon: int,
+    max_delay: int,
+    device: torch.device,
+    sampling_mode: str = "uniform",
+    sampling_weights: list[float] | None = None,
+) -> tuple[Tensor | None, Tensor | None]:
+    """Sample prefix lengths and build the corresponding boolean prefix mask."""
+    delays = _sample_training_rtc_prefix_lengths(
+        batch_size,
+        max_delay,
+        device,
+        sampling_mode=sampling_mode,
+        sampling_weights=sampling_weights,
+    )
+    if delays is None:
+        return None, None
+    positions = torch.arange(action_horizon, device=device)
+    return positions.unsqueeze(0) < delays.unsqueeze(1), delays
+
+
+def _sample_training_rtc_prefix_mask(
+    batch_size: int,
+    action_horizon: int,
+    max_delay: int,
+    device: torch.device,
+    sampling_mode: str = "uniform",
+    sampling_weights: list[float] | None = None,
+) -> Tensor | None:
+    """Backward-compatible wrapper returning only the sampled prefix mask."""
+    prefix_mask, _ = _sample_training_rtc_prefix(
+        batch_size,
+        action_horizon,
+        max_delay,
+        device,
+        sampling_mode=sampling_mode,
+        sampling_weights=sampling_weights,
+    )
+    return prefix_mask
+
+
+def _build_flow_matching_inputs(
+    actions: Tensor,
+    noise: Tensor,
+    time: Tensor,
+    prefix_mask: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Build PI0.5 flow inputs, optionally keeping an action prefix clean."""
+    if time.shape != actions.shape[:1]:
+        raise ValueError(f"time must have shape (batch,), got {tuple(time.shape)}")
+    if prefix_mask is not None and prefix_mask.shape != actions.shape[:2]:
+        raise ValueError(f"prefix_mask must have shape (batch, horizon), got {tuple(prefix_mask.shape)}")
+
+    if prefix_mask is None:
+        model_time = time
+        expanded_time = time[:, None, None]
+    else:
+        model_time = time[:, None].expand_as(prefix_mask)
+        model_time = torch.where(prefix_mask, torch.zeros_like(model_time), model_time)
+        expanded_time = model_time.unsqueeze(-1)
+
+    x_t = expanded_time * noise + (1 - expanded_time) * actions
+    return x_t, noise - actions, model_time
+
+
+def _reduce_training_rtc_loss(
+    losses: Tensor,
+    prefix_mask: Tensor | None,
+    reduction: str,
+) -> Tensor:
+    """Average flow loss over the predicted postfix, excluding the clean prefix."""
+    if reduction not in {"mean", "none"}:
+        raise ValueError(f"Unsupported loss reduction: {reduction!r}")
+    if prefix_mask is None:
+        return losses.mean() if reduction == "mean" else losses.mean(dim=(1, 2))
+
+    postfix_mask = (~prefix_mask).unsqueeze(-1).expand_as(losses)
+    if reduction == "none":
+        numerator = (losses * postfix_mask).sum(dim=(1, 2))
+        denominator = postfix_mask.sum(dim=(1, 2))
+        return numerator / denominator.clamp(min=1)
+    return (losses * postfix_mask).sum() / postfix_mask.sum().clamp(min=1)
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -87,8 +250,10 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError(
+            "The time tensor must have shape (batch_size,) or (batch_size, action_horizon)."
+        )
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -96,8 +261,8 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = time[..., None] * scaling_factor
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
@@ -567,6 +732,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
+
         self.rtc_processor = rtc_processor
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
@@ -740,14 +906,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise, time) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise,
+        time,
+        prefix_mask: Tensor | None = None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t, u_t, model_time = _build_flow_matching_inputs(actions, noise, time, prefix_mask)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t, model_time
+        )
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -833,10 +1009,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
 
+        rtc_mode = "guided"
+        trained_prefix = trained_prefix_mask = None
+        if self._rtc_enabled():
+            if self.rtc_processor is None:
+                raise ValueError(
+                    "RTC is enabled in the config but PI05Pytorch was built without an RTCProcessor"
+                )
+            rtc_mode = self.rtc_processor.rtc_config.mode
+            if rtc_mode == "trained":
+                training_max_delay = int(getattr(self.config, "rtc_training_max_delay", 0))
+                if training_max_delay <= 0:
+                    raise ValueError(
+                        "RTC mode='trained' requires a checkpoint trained with "
+                        "policy.rtc_training_max_delay > 0."
+                    )
+                trained_prefix, trained_prefix_mask = _prepare_trained_rtc_prefix(
+                    noise,
+                    kwargs.get("prev_chunk_left_over"),
+                    int(kwargs.get("inference_delay") or 0),
+                    training_max_delay,
+                )
+
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+            if trained_prefix is not None:
+                x_t = torch.where(trained_prefix_mask, trained_prefix, x_t)
+                time_tensor = time_tensor[:, None].expand(bsize, x_t.shape[1]).clone()
+                time_tensor[trained_prefix_mask[..., 0]] = 0.0
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -846,7 +1049,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
+            if self._rtc_enabled() and rtc_mode == "guided":
                 inference_delay = kwargs.get("inference_delay")
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
@@ -863,6 +1066,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
+
+            if trained_prefix is not None:
+                x_t = torch.where(trained_prefix_mask, trained_prefix, x_t)
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -928,6 +1134,12 @@ class PI05Policy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+
+        # Runtime-only counters. They are intentionally not module buffers, so
+        # DDP does not broadcast rank-0 counts over the other ranks and they do
+        # not become part of checkpoints or the model architecture.
+        self._rtc_training_interval_counts: Tensor | None = None
+        self._rtc_training_cumulative_counts: Tensor | None = None
 
         # Initialize the core PI05 model
         self.init_rtc_processor()
@@ -1170,6 +1382,71 @@ class PI05Policy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
+    def _record_rtc_training_prefix_lengths(self, delays: Tensor | None) -> None:
+        """Accumulate local per-rank RTC sampling counts without synchronizing."""
+        if delays is None:
+            return
+        num_delays = self.config.rtc_training_max_delay + 1
+        counts = torch.bincount(delays, minlength=num_delays).to(dtype=torch.int64)
+        if (
+            self._rtc_training_interval_counts is None
+            or self._rtc_training_interval_counts.device != counts.device
+        ):
+            self._rtc_training_interval_counts = torch.zeros_like(counts)
+            self._rtc_training_cumulative_counts = torch.zeros_like(counts)
+        self._rtc_training_interval_counts.add_(counts)
+        self._rtc_training_cumulative_counts.add_(counts)
+
+    def get_rtc_training_sampling_counts(self) -> tuple[Tensor, Tensor] | None:
+        """Return local interval and cumulative counts for distributed reduction."""
+        if self._rtc_training_interval_counts is None:
+            return None
+        return (
+            self._rtc_training_interval_counts.clone(),
+            self._rtc_training_cumulative_counts.clone(),
+        )
+
+    def reset_rtc_training_interval_counts(self) -> None:
+        """Start a fresh logging interval while preserving cumulative counts."""
+        if self._rtc_training_interval_counts is not None:
+            self._rtc_training_interval_counts.zero_()
+
+    def get_rtc_training_sampling_log_metrics(
+        self,
+        interval_counts: Tensor,
+        cumulative_counts: Tensor,
+    ) -> dict[str, float | int]:
+        """Format globally reduced RTC counts and configured distribution for logging."""
+        mode = self.config.rtc_training_sampling_mode
+        probabilities = self.config.get_rtc_training_sampling_probabilities()
+        metrics: dict[str, float | int] = {
+            "rtc_sampling/mode_uniform": int(mode == "uniform"),
+            "rtc_sampling/mode_weighted": int(mode == "weighted"),
+        }
+        interval_total = int(interval_counts.sum().item())
+        cumulative_total = int(cumulative_counts.sum().item())
+        metrics["rtc_sampling/interval/total"] = interval_total
+        metrics["rtc_sampling/cumulative/total"] = cumulative_total
+
+        raw_weights = (
+            self.config.rtc_training_sampling_weights if mode == "weighted" else None
+        )
+        for delay, probability in enumerate(probabilities):
+            interval_count = int(interval_counts[delay].item())
+            cumulative_count = int(cumulative_counts[delay].item())
+            metrics[f"rtc_sampling/configured_probability/d_{delay}"] = probability
+            if raw_weights is not None:
+                metrics[f"rtc_sampling/configured_weight/d_{delay}"] = float(raw_weights[delay])
+            metrics[f"rtc_sampling/interval/count_d_{delay}"] = interval_count
+            metrics[f"rtc_sampling/interval/ratio_d_{delay}"] = (
+                interval_count / interval_total if interval_total else 0.0
+            )
+            metrics[f"rtc_sampling/cumulative/count_d_{delay}"] = cumulative_count
+            metrics[f"rtc_sampling/cumulative/ratio_d_{delay}"] = (
+                cumulative_count / cumulative_total if cumulative_total else 0.0
+            )
+        return metrics
+
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
@@ -1355,25 +1632,50 @@ class PI05Policy(PreTrainedPolicy):
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
 
+        prefix_mask, sampled_delays = _sample_training_rtc_prefix(
+            actions.shape[0],
+            actions.shape[1],
+            self.config.rtc_training_max_delay,
+            actions.device,
+            sampling_mode=self.config.rtc_training_sampling_mode,
+            sampling_weights=self.config.rtc_training_sampling_weights,
+        )
+        self._record_rtc_training_prefix_lengths(sampled_delays)
+
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            noise,
+            time,
+            prefix_mask=prefix_mask,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
-        loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-        }
+        if prefix_mask is None:
+            loss_per_dim = losses.mean(dim=(0, 1))
+        else:
+            postfix_mask = (~prefix_mask).unsqueeze(-1).expand_as(losses)
+            loss_per_dim = (losses * postfix_mask).sum(dim=(0, 1)) / postfix_mask.sum(
+                dim=(0, 1)
+            ).clamp(min=1)
+
+        loss_dict = {"loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist()}
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="none")
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="mean")
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

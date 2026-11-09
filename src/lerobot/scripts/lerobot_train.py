@@ -21,6 +21,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 import dataclasses
 import logging
 import time
+from collections import deque
 from contextlib import nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -34,9 +35,14 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
+    get_best_checkpoint_dir,
+    get_best_checkpoint_window_start,
     get_step_checkpoint_dir,
     get_step_identifier,
+    is_best_checkpoint_candidate_step,
+    load_best_checkpoint_metadata,
     load_training_state,
+    save_best_checkpoint_metadata,
     save_checkpoint,
     update_last_checkpoint,
 )
@@ -451,9 +457,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     }
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
-    effective_batch_size = (
-        cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
-    )
+    effective_batch_size = cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
     train_tracker = MetricsTracker(
         cfg.batch_size * cfg.gradient_accumulation_steps,
         dataset.num_frames,
@@ -466,6 +470,49 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     action_error_accumulator = ActionErrorAccumulator() if cfg.action_error_metrics.enabled else None
     action_error_report_count = 0
     action_error_dir = cfg.output_dir / "action_error_metrics"
+
+    best_checkpoint_enabled = cfg.save_checkpoint and cfg.best_checkpoint.enabled
+    best_checkpoint_frequency = cfg.best_checkpoint.every_n_steps or cfg.log_freq
+    best_loss_window = deque(maxlen=best_checkpoint_frequency) if best_checkpoint_enabled else None
+    best_update_loss_sum = 0.0
+    best_update_loss_count = 0
+    best_loss = float("inf")
+    best_step = None
+    best_checkpoint_dir = get_best_checkpoint_dir(cfg.output_dir)
+    best_window_start = get_best_checkpoint_window_start(cfg.steps, cfg.best_checkpoint.window_steps)
+    if best_checkpoint_enabled:
+        best_metadata = load_best_checkpoint_metadata(best_checkpoint_dir)
+        if (
+            best_metadata is not None
+            and best_metadata.get("total_steps") == cfg.steps
+            and best_metadata.get("window_start") == best_window_start
+            and best_metadata.get("every_n_steps") == best_checkpoint_frequency
+        ):
+            best_loss = float(best_metadata["loss"])
+            best_step = int(best_metadata["step"])
+            if is_main_process:
+                logging.info(
+                    "Resume best-checkpoint tracking: step=%d loss=%.8f",
+                    best_step,
+                    best_loss,
+                )
+        elif best_metadata is not None and is_main_process:
+            logging.info(
+                "Ignore an existing best checkpoint from different selection settings "
+                "(current window: %d-%d, frequency: %d)",
+                best_window_start,
+                cfg.steps,
+                best_checkpoint_frequency,
+            )
+
+        if is_main_process:
+            logging.info(
+                "Best checkpoint selection is enabled for steps %d-%d "
+                "(global mean training loss every %d steps)",
+                best_window_start,
+                cfg.steps,
+                best_checkpoint_frequency,
+            )
 
     if is_main_process and cfg.eval_freq > 0 and cfg.env is None:
         if action_error_accumulator is None:
@@ -514,6 +561,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 sample_weighter=sample_weighter,
             )
 
+        if best_loss_window is not None:
+            best_update_loss_sum += float(train_tracker.loss.val)
+            best_update_loss_count += 1
+
         # An optimizer update is complete only after all accumulation micro-batches.
         if not accelerator.sync_gradients:
             continue
@@ -524,20 +575,67 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if is_main_process:
             progbar.update(1)
         train_tracker.step()
-        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+        if best_loss_window is not None:
+            best_loss_window.append(best_update_loss_sum / best_update_loss_count)
+            best_update_loss_sum = 0.0
+            best_update_loss_count = 0
+        is_global_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+        is_log_step = is_global_log_step and is_main_process
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
         action_error_freq = cfg.action_error_metrics.every_n_steps or cfg.log_freq
-        is_offline_eval_step = (
-            action_error_accumulator is not None
-            and cfg.env is None
-            and is_eval_step
-        )
+        is_offline_eval_step = action_error_accumulator is not None and cfg.env is None and is_eval_step
         is_action_error_step = is_offline_eval_step or (
-            action_error_accumulator is not None
-            and action_error_freq > 0
-            and step % action_error_freq == 0
+            action_error_accumulator is not None and action_error_freq > 0 and step % action_error_freq == 0
         )
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        best_candidate_loss = None
+        is_new_best_checkpoint = False
+
+        rtc_sampling_metrics = None
+        if is_global_log_step:
+            unwrapped_policy = accelerator.unwrap_model(policy)
+            if has_method(unwrapped_policy, "get_rtc_training_sampling_counts"):
+                local_counts = unwrapped_policy.get_rtc_training_sampling_counts()
+                if local_counts is not None:
+                    interval_counts, cumulative_counts = local_counts
+                    interval_counts = accelerator.reduce(interval_counts, reduction="sum")
+                    cumulative_counts = accelerator.reduce(cumulative_counts, reduction="sum")
+                    unwrapped_policy.reset_rtc_training_interval_counts()
+                    if is_main_process:
+                        rtc_sampling_metrics = unwrapped_policy.get_rtc_training_sampling_log_metrics(
+                            interval_counts,
+                            cumulative_counts,
+                        )
+        if (
+            best_loss_window is not None
+            and is_best_checkpoint_candidate_step(
+                step,
+                cfg.steps,
+                cfg.best_checkpoint.window_steps,
+                best_checkpoint_frequency,
+            )
+            and (len(best_loss_window) == best_checkpoint_frequency or step == cfg.steps)
+        ):
+            loss_totals = torch.tensor(
+                [sum(best_loss_window), len(best_loss_window)],
+                dtype=torch.float64,
+                device=accelerator.device,
+            )
+            loss_totals = accelerator.reduce(loss_totals, reduction="sum")
+            best_candidate_loss = (loss_totals[0] / loss_totals[1]).item()
+            is_new_best_checkpoint = best_candidate_loss < best_loss
+            if is_new_best_checkpoint:
+                best_loss = best_candidate_loss
+                best_step = step
+            if is_main_process and wandb_logger:
+                wandb_logger.log_dict(
+                    {
+                        "best_checkpoint/candidate_loss": best_candidate_loss,
+                        "best_checkpoint/best_loss": best_loss,
+                        "best_checkpoint/best_step": best_step,
+                    },
+                    step,
+                )
 
         if is_action_error_step:
             unwrapped_policy = accelerator.unwrap_model(policy)
@@ -616,6 +714,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
+                if rtc_sampling_metrics:
+                    wandb_log_dict.update(rtc_sampling_metrics)
                 # Log sample weighting statistics if enabled
                 if sample_weighter is not None:
                     weighter_stats = sample_weighter.get_stats()
@@ -640,6 +740,34 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+
+            accelerator.wait_for_everyone()
+
+        if is_new_best_checkpoint:
+            if is_main_process:
+                logging.info(
+                    "Save new best checkpoint after step %d: loss=%.8f",
+                    step,
+                    best_candidate_loss,
+                )
+                save_checkpoint(
+                    checkpoint_dir=best_checkpoint_dir,
+                    step=step,
+                    cfg=cfg,
+                    policy=accelerator.unwrap_model(policy),
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                )
+                save_best_checkpoint_metadata(
+                    best_checkpoint_dir,
+                    step=step,
+                    loss=best_candidate_loss,
+                    total_steps=cfg.steps,
+                    window_start=best_window_start,
+                    every_n_steps=best_checkpoint_frequency,
+                )
 
             accelerator.wait_for_everyone()
 

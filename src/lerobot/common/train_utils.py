@@ -37,6 +37,9 @@ from lerobot.utils.constants import (
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
 
+BEST_CHECKPOINT_DIR = "best"
+BEST_CHECKPOINT_METADATA = "best_checkpoint.json"
+
 
 def get_step_identifier(step: int, total_steps: int) -> str:
     num_digits = max(6, len(str(total_steps)))
@@ -47,6 +50,52 @@ def get_step_checkpoint_dir(output_dir: Path, total_steps: int, step: int) -> Pa
     """Returns the checkpoint sub-directory corresponding to the step number."""
     step_identifier = get_step_identifier(step, total_steps)
     return output_dir / CHECKPOINTS_DIR / step_identifier
+
+
+def get_best_checkpoint_dir(output_dir: Path) -> Path:
+    """Return the dedicated checkpoint directory used for the best model."""
+    return output_dir / CHECKPOINTS_DIR / BEST_CHECKPOINT_DIR
+
+
+def get_best_checkpoint_window_start(total_steps: int, window_steps: int) -> int:
+    """Return the first checkpoint step eligible for final-window best selection."""
+    return max(1, total_steps - window_steps)
+
+
+def is_best_checkpoint_candidate_step(
+    step: int, total_steps: int, window_steps: int, every_n_steps: int
+) -> bool:
+    """Return whether a step should be compared for the final-window best checkpoint."""
+    window_start = get_best_checkpoint_window_start(total_steps, window_steps)
+    return step >= window_start and ((step - window_start) % every_n_steps == 0 or step == total_steps)
+
+
+def save_best_checkpoint_metadata(
+    checkpoint_dir: Path,
+    *,
+    step: int,
+    loss: float,
+    total_steps: int,
+    window_start: int,
+    every_n_steps: int,
+) -> None:
+    write_json(
+        {
+            "step": step,
+            "loss": loss,
+            "total_steps": total_steps,
+            "window_start": window_start,
+            "every_n_steps": every_n_steps,
+        },
+        checkpoint_dir / BEST_CHECKPOINT_METADATA,
+    )
+
+
+def load_best_checkpoint_metadata(checkpoint_dir: Path) -> dict | None:
+    metadata_path = checkpoint_dir / BEST_CHECKPOINT_METADATA
+    if not metadata_path.is_file():
+        return None
+    return load_json(metadata_path)
 
 
 def save_training_step(step: int, save_dir: Path) -> None:
