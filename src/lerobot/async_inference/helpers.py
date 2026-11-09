@@ -287,6 +287,20 @@ class TimedObservation(TimedData):
     trajectory_step: int = 0
     fps: float = 0.0
     client_remaining_execution_budget: int | None = None
+    protocol_version: int = 1
+    request_kind: str = "action"
+    session_id: str = ""
+    request_id: str = ""
+    query_id: str = ""
+    subtask_epoch: int = 0
+    profile: str = ""
+    checkpoint_fingerprint: str = ""
+    stage_step: int = 0
+    observation_timestamp_ns: int = 0
+    current_subtask: str = ""
+    current_subtask_index: int = 0
+    query_text: str = ""
+    allowed_subtasks: list[str] = field(default_factory=list)
 
     def get_observation(self):
         return self.observation
@@ -329,6 +343,9 @@ class RemotePolicyConfig:
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
     rtc_config: dict[str, Any] | None = None
+    protocol_version: int = 1
+    profile: str = ""
+    checkpoint_fingerprint: str = ""
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

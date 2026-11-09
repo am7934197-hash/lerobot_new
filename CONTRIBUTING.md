@@ -14,7 +14,9 @@ You can contribute in many ways:
 - **Documentation:** Improve examples, guides, and docstrings.
 - **Feedback:** Submit tickets related to bugs or desired new features.
 
-If you are unsure where to start, join our [Discord Channel](https://discord.gg/q8Dzzpym3f).
+**Adding new hardware?** Robots, teleoperators, and cameras usually work best as a standalone plugin package rather than a change to the core library. Follow [Bring Your Own Hardware](https://huggingface.co/docs/lerobot/integrate_hardware#using-your-own-lerobot-devices-), publish your package, then open a PR adding it to [Third-Party Robots & Teleoperators](https://huggingface.co/docs/lerobot/third_party_robots) or [Third-Party Cameras & Sensors](https://huggingface.co/docs/lerobot/third_party_sensors).
+
+If you are unsure where to start, join our [Discord Channel](https://discord.gg/s3KuuzsPFb).
 
 ## Development Setup
 
@@ -49,6 +51,10 @@ To run checks manually on all files:
 ```bash
 pre-commit run --all-files
 ```
+
+### Docstrings
+
+The API reference is generated from the docstrings in `src/lerobot/`. If you add or change anything public, follow the [docstring standard](https://huggingface.co/docs/lerobot/writing_docstrings) — the format is parsed by the renderer and checked in CI.
 
 ### Running Tests
 

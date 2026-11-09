@@ -14,7 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
+from numbers import Real
+
+import torch
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -46,22 +50,36 @@ class RightArmImageDropoutConfig:
 class PI05Config(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
-    dtype: str = "float32"  # Options: "bfloat16", "float32"
+    dtype: torch.dtype | None = torch.float32
 
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
+    # MEM short-horizon observation memory (https://arxiv.org/abs/2603.03596).
+    # Historical image tokens are fused inside SigLIP and dropped before the
+    # language backbone. Historical proprioceptive states become one continuous
+    # backbone token per frame. Both paths are opt-in and independent.
+    #
+    # MEM pre-trains on six observations spaced one second apart. `memory_stride` is
+    # counted in dataset frames, so the default matches that spacing only at 30 fps,
+    # the usual LeRobot recording rate. Scale it with the dataset: a 10 fps dataset
+    # such as `lerobot/robomme` needs `memory_stride=10` for the same one second.
+    use_visual_memory: bool = False
+    use_proprioceptive_memory: bool = False
+    memory_frames: int = 6
+    memory_stride: int = 30
+    memory_temporal_attention_every: int = 4
+
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
 
-    # During training, independently omit the complete state token sequence for
-    # each sample with this probability. Inference always keeps the state.
+    # Existing PI0.5 configs may hide state tokens for supervised examples.
+    # Inference always keeps state tokens when proprioceptive memory is disabled.
     state_dropout_prob: float = 0.0
 
-    # During training, independently mask the right-arm camera for each sample.
-    # Evaluation and inference always keep the camera.
+    # During training, independently mask the right-arm camera per sample.
     right_arm_image_dropout: RightArmImageDropoutConfig = field(
         default_factory=RightArmImageDropoutConfig
     )
@@ -84,6 +102,12 @@ class PI05Config(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
+    # Maximum clean action-prefix length sampled during training. Zero disables trained RTC.
+    rtc_training_max_delay: int = 0
+    # Prefix lengths are sampled uniformly by default for backward compatibility.
+    # In weighted mode, one weight is required for every d in [0, max_delay].
+    rtc_training_sampling_mode: str = "uniform"
+    rtc_training_sampling_weights: list[float] | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
@@ -94,6 +118,7 @@ class PI05Config(PreTrainedConfig):
     empty_cameras: int = 0
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
+    text_tokenizer_name: str = "google/paligemma-3b-pt-224"
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -110,8 +135,7 @@ class PI05Config(PreTrainedConfig):
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
     # Finetuning settings
-    # Optional standalone SigLIP checkpoint. It is loaded after pretrained_path,
-    # so task-specific vision weights are not overwritten by the PI0.5 base.
+    # Loaded after the full PI0.5/FineART checkpoint so these weights win.
     vision_tower_pretrained_path: str | None = None
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
@@ -122,6 +146,7 @@ class PI05Config(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
+    optimizer_fused: bool | None = None
 
     # Scheduler settings: see openpi `CosineDecaySchedule`
     # Note: These will auto-scale if --steps < scheduler_decay_steps
@@ -129,8 +154,6 @@ class PI05Config(PreTrainedConfig):
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
-
-    tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     def __post_init__(self):
         super().__post_init__()
@@ -140,6 +163,42 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
+        if not 0 <= self.rtc_training_max_delay < self.chunk_size:
+            raise ValueError(
+                "rtc_training_max_delay must satisfy "
+                f"0 <= delay < chunk_size ({self.chunk_size}), got {self.rtc_training_max_delay}"
+            )
+        if self.rtc_training_sampling_mode not in {"uniform", "weighted"}:
+            raise ValueError(
+                "rtc_training_sampling_mode must be 'uniform' or 'weighted', "
+                f"got {self.rtc_training_sampling_mode!r}"
+            )
+        if self.rtc_training_sampling_mode == "weighted":
+            weights = self.rtc_training_sampling_weights
+            if weights is None:
+                raise ValueError(
+                    "rtc_training_sampling_weights must be provided when "
+                    "rtc_training_sampling_mode='weighted'"
+                )
+            expected_length = self.rtc_training_max_delay + 1
+            if len(weights) != expected_length:
+                raise ValueError(
+                    "rtc_training_sampling_weights must contain exactly "
+                    f"rtc_training_max_delay + 1 ({expected_length}) values, got {len(weights)}"
+                )
+            for index, weight in enumerate(weights):
+                if isinstance(weight, bool) or not isinstance(weight, Real):
+                    raise ValueError(
+                        "rtc_training_sampling_weights must contain finite, non-negative numbers; "
+                        f"weight for d={index} is {weight!r}"
+                    )
+                if not math.isfinite(float(weight)) or weight < 0:
+                    raise ValueError(
+                        "rtc_training_sampling_weights must contain finite, non-negative numbers; "
+                        f"weight for d={index} is {weight!r}"
+                    )
+            if math.fsum(float(weight) for weight in weights) <= 0:
+                raise ValueError("rtc_training_sampling_weights must have a sum greater than 0")
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
@@ -147,16 +206,40 @@ class PI05Config(PreTrainedConfig):
         if self.action_expert_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")
 
-        if self.dtype not in ["bfloat16", "float32"]:
+        if self.dtype not in [torch.bfloat16, torch.float32]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.memory_frames < 1:
+            raise ValueError("memory_frames must be at least 1")
+        if self.memory_stride < 1:
+            raise ValueError("memory_stride must be at least 1")
+        if self.memory_temporal_attention_every < 1:
+            raise ValueError("memory_temporal_attention_every must be at least 1")
 
         if not 0.0 <= self.state_dropout_prob <= 1.0:
             raise ValueError(
                 f"state_dropout_prob must be between 0 and 1, got {self.state_dropout_prob}"
             )
 
+    def get_rtc_training_sampling_probabilities(self) -> list[float]:
+        """Return normalized probabilities for d=0..rtc_training_max_delay."""
+        num_delays = self.rtc_training_max_delay + 1
+        if self.rtc_training_sampling_mode == "uniform":
+            return [1.0 / num_delays] * num_delays
+
+        weights = self.rtc_training_sampling_weights
+        if weights is None:  # pragma: no cover - defensive guard for mutated configs
+            raise ValueError("rtc_training_sampling_weights is required in weighted mode")
+        total = math.fsum(float(weight) for weight in weights)
+        return [float(weight) / total for weight in weights]
+
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
+        if self.input_features is None or self.output_features is None:
+            raise ValueError(
+                "input_features and output_features must be resolved (e.g. from the dataset) "
+                "before calling validate_features()"
+            )
         for i in range(self.empty_cameras):
             key = OBS_IMAGES + f".empty_camera_{i}"
             empty_camera = PolicyFeature(
@@ -192,6 +275,7 @@ class PI05Config(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=self.optimizer_grad_clip_norm,
+            fused=self.optimizer_fused,
         )
 
     def get_scheduler_preset(self):
@@ -205,6 +289,20 @@ class PI05Config(PreTrainedConfig):
     @property
     def observation_delta_indices(self) -> None:
         return None
+
+    @property
+    def image_observation_delta_indices(self) -> list[int] | None:
+        if not self.use_visual_memory:
+            return None
+        horizon = (self.memory_frames - 1) * self.memory_stride
+        return list(range(-horizon, 1, self.memory_stride))
+
+    @property
+    def state_observation_delta_indices(self) -> list[int] | None:
+        if not self.use_proprioceptive_memory:
+            return None
+        horizon = (self.memory_frames - 1) * self.memory_stride
+        return list(range(-horizon, 1, self.memory_stride))
 
     @property
     def action_delta_indices(self) -> list:

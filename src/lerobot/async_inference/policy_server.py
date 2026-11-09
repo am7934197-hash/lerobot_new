@@ -25,13 +25,16 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import logging
+import hashlib
 import math
 import os
 import pickle  # nosec
 import threading
 import time
+import uuid
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -44,6 +47,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc import LatencyTracker, RTCConfig, RTCProcessor
+from lerobot.policies.rtc.configuration_rtc import validate_trained_rtc_horizon
 from lerobot.policies.rtc.relative import reanchor_relative_rtc_prefix
 from lerobot.processor import (
     NormalizerProcessorStep,
@@ -57,7 +61,8 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
-from lerobot.types import PolicyAction
+from lerobot.lerobot_types import PolicyAction
+from lerobot.utils.constants import QUERY_KIND, QUERY_TEXT
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -73,12 +78,77 @@ from .helpers import (
 )
 
 
+def _resolve_local_text_tokenizer(tokenizer_name: str | None) -> str | None:
+    """Resolve a tokenizer without requiring Hub access on an inference host."""
+    override = os.environ.get("LEROBOT_TEXT_TOKENIZER_PATH")
+    if override:
+        override_path = Path(override).expanduser()
+        if not override_path.is_dir():
+            raise FileNotFoundError(
+                f"LEROBOT_TEXT_TOKENIZER_PATH is not a directory: {override_path}"
+            )
+        return str(override_path)
+
+    if not tokenizer_name:
+        return None
+    tokenizer_path = Path(tokenizer_name).expanduser()
+    if tokenizer_path.is_dir():
+        return str(tokenizer_path)
+    if "/" not in tokenizer_name:
+        return tokenizer_name
+
+    cache_root = Path(
+        os.environ.get(
+            "HF_HUB_CACHE",
+            Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub",
+        )
+    ).expanduser()
+    snapshots_dir = cache_root / f"models--{tokenizer_name.replace('/', '--')}" / "snapshots"
+    if not snapshots_dir.is_dir():
+        return tokenizer_name
+
+    candidates = sorted(
+        (path for path in snapshots_dir.iterdir() if path.is_dir()),
+        key=lambda path: (path.name != "local", path.name),
+    )
+    for candidate in candidates:
+        if (candidate / "config.json").is_file():
+            return str(candidate)
+    return tokenizer_name
+
+
+def _conditioned_rtc_delay_frames(
+    predicted_delay_frames: int,
+    safety_margin_frames: int,
+    training_max_delay: int,
+    prefix_frames_used: int,
+) -> int:
+    """Return a conservative trained-RTC delay within checkpoint/prefix capacity."""
+    return min(
+        predicted_delay_frames + safety_margin_frames,
+        training_max_delay,
+        prefix_frames_used,
+    )
+
+
+def _rtc_delay_rejection_reason(
+    *,
+    trained_with_prefix: bool,
+    actual_delay_frames: int,
+    conditioned_delay_frames: int,
+) -> str | None:
+    if trained_with_prefix and actual_delay_frames > conditioned_delay_frames:
+        return "actual_delay_exceeded_conditioning"
+    return None
+
+
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     prefix = "policy_server"
     logger = get_logger(prefix)
 
     def __init__(self, config: PolicyServerConfig):
         self.config = config
+        self.server_instance_id = uuid.uuid4().hex
         self.shutdown_event = threading.Event()
 
         # FPS measurement
@@ -95,9 +165,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.device = None
         self.policy_type = None
         self.lerobot_features = None
+        self.rename_map: dict[str, str] = {}
         self.actions_per_chunk = None
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
+        self.language_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
         self.rtc_config = config.rtc
         self.rtc_latency_tracker = LatencyTracker()
@@ -111,6 +183,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     @property
     def policy_image_features(self):
         return self.policy.config.image_features
+
+    @property
+    def transport_image_features(self):
+        """Return model shapes keyed by the camera names present on the wire."""
+        result = {}
+        for raw_key in self.lerobot_features or {}:
+            if not raw_key.startswith("observation.images."):
+                continue
+            policy_key = self.rename_map.get(raw_key, raw_key)
+            if policy_key not in self.policy_image_features:
+                raise KeyError(
+                    f"Camera mapping {raw_key!r} -> {policy_key!r} is not present in checkpoint"
+                )
+            result[raw_key] = self.policy_image_features[policy_key]
+        return result
 
     def _reset_server(self) -> None:
         """Flushes server state when new client connects."""
@@ -132,7 +219,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if raw_config:
             for key in (
                 "enabled",
+                "mode",
                 "execution_horizon",
+                "delay_safety_margin_frames",
                 "max_guidance_weight",
                 "prefix_attention_schedule",
                 "debug",
@@ -152,6 +241,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._reset_server()
         self.shutdown_event.clear()
 
+        context.set_trailing_metadata(
+            (
+                ("x-lerobot-protocol-version", str(self.config.protocol_version)),
+                ("x-lerobot-server-instance-id", self.server_instance_id),
+                ("x-lerobot-profile", self.config.expected_policy_type),
+                (
+                    "x-lerobot-checkpoint-fingerprint",
+                    self.config.expected_checkpoint_fingerprint,
+                ),
+            )
+        )
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
@@ -173,6 +273,29 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Policy type {policy_specs.policy_type} not supported. "
                 f"Supported policies: {SUPPORTED_POLICIES}"
             )
+        if int(getattr(policy_specs, "protocol_version", 0)) != self.config.protocol_version:
+            raise ValueError("Client protocol_version does not match the server")
+        if self.config.expected_policy_type and (
+            policy_specs.policy_type != self.config.expected_policy_type
+            or getattr(policy_specs, "profile", "") != self.config.expected_policy_type
+        ):
+            raise ValueError("Server is pinned to a different policy Profile")
+        if self.config.expected_checkpoint_path and Path(
+            policy_specs.pretrained_name_or_path
+        ).resolve() != Path(self.config.expected_checkpoint_path).resolve():
+            raise ValueError("Server is pinned to a different checkpoint path")
+        config_path = Path(policy_specs.pretrained_name_or_path) / "config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Checkpoint config does not exist: {config_path}")
+        checkpoint_fingerprint = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        requested_fingerprint = str(getattr(policy_specs, "checkpoint_fingerprint", ""))
+        if requested_fingerprint and checkpoint_fingerprint != requested_fingerprint:
+            raise ValueError("Checkpoint fingerprint does not match the client request")
+        if (
+            self.config.expected_checkpoint_fingerprint
+            and checkpoint_fingerprint != self.config.expected_checkpoint_fingerprint
+        ):
+            raise ValueError("Checkpoint fingerprint does not match the pinned server config")
 
         self.logger.info(
             f"Receiving policy instructions from {client_id} | "
@@ -185,6 +308,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.device = policy_specs.device
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
+        self.rename_map = dict(policy_specs.rename_map)
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self._configure_rtc(getattr(policy_specs, "rtc_config", None))
 
@@ -196,7 +320,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         pretrained_path = policy_specs.pretrained_name_or_path
         load_kwargs: dict[str, Any] = {}
         if os.environ.get("LEROBOT_POLICY_COMPILE", "0") != "1":
-            policy_cfg = PreTrainedConfig.from_pretrained(pretrained_path)
+            policy_cfg = PreTrainedConfig.from_pretrained(
+                pretrained_path,
+                fallback_policy_type=self.policy_type,
+            )
             if getattr(policy_cfg, "compile_model", False):
                 policy_cfg.compile_model = False
                 self.logger.info(
@@ -206,15 +333,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             load_kwargs["config"] = policy_cfg
 
         self.policy = policy_class.from_pretrained(pretrained_path, **load_kwargs)
-        if self.policy_type == "pi05":
+        if self.policy_type in {"pi05", "fineart_vla"}:
             self.policy.config.rtc_config = self.rtc_config
             self.policy.init_rtc_processor()
             if self.rtc_config.enabled and not isinstance(self.policy.rtc_processor, RTCProcessor):
                 raise RuntimeError("Pi0.5 RTCProcessor was not initialized")
+            if self.rtc_config.enabled and self.rtc_config.mode == "trained":
+                validate_trained_rtc_horizon(
+                    self.rtc_config.execution_horizon,
+                    self.policy.config.chunk_size,
+                    self.policy.config.rtc_training_max_delay,
+                )
             self.logger.info(
-                "Pi0.5 RTC configured: enabled=%s mode=guided execution_horizon=%d "
+                "Pi0.5 RTC configured: enabled=%s mode=%s execution_horizon=%d "
                 "max_guidance_weight=%.3f prefix_attention_schedule=%s processor=%s",
                 self.rtc_config.enabled,
+                self.rtc_config.mode,
                 self.rtc_config.execution_horizon,
                 self.rtc_config.max_guidance_weight,
                 self.rtc_config.prefix_attention_schedule.value,
@@ -229,15 +363,35 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
+        preprocessor_overrides = {
+            "device_processor": device_override,
+            "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+        }
+        local_text_tokenizer = None
+        if self.policy_type == "fineart_vla":
+            local_text_tokenizer = _resolve_local_text_tokenizer(
+                getattr(self.policy.config, "text_tokenizer_name", None)
+            )
+        if local_text_tokenizer is not None:
+            preprocessor_overrides["action_tokenizer_processor"] = {
+                "paligemma_tokenizer_name": local_text_tokenizer
+            }
+            if local_text_tokenizer != getattr(self.policy.config, "text_tokenizer_name", None):
+                self.logger.info("Using local text tokenizer: %s", local_text_tokenizer)
+
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
+            preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": device_override},
         )
+        if self.policy_type == "fineart_vla":
+            self.language_preprocessor, _unused_postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=policy_specs.pretrained_name_or_path,
+                preprocessor_overrides=preprocessor_overrides,
+                postprocessor_overrides={"device_processor": device_override},
+            )
         abs_steps = [
             s
             for s in self.postprocessor.steps
@@ -276,7 +430,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         handler_start = time.perf_counter()
         trace_id = self._trace_id(context)
         self.logger.info(
-            "SERVER TRACE trace_id=%s event=SERVER_REQUEST_RECEIVED perf_s=%.6f",
+            "服务端追踪：收到请求 trace_id=%s event=SERVER_REQUEST_RECEIVED perf_s=%.6f",
             trace_id,
             handler_start,
         )
@@ -287,6 +441,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
         timed_observation = pickle.loads(received_bytes)  # nosec
+        if not isinstance(timed_observation, TimedObservation):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Expected TimedObservation")
+        if int(getattr(timed_observation, "protocol_version", 0)) != self.config.protocol_version:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Protocol version mismatch")
+        if getattr(timed_observation, "profile", "") != self.policy_type:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Profile mismatch")
+        if getattr(timed_observation, "request_kind", "") not in {"action", "next_subtask"}:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unknown request_kind")
         deserialize_time = time.perf_counter() - start_deserialize
         decoded_at = time.perf_counter()
         trace_id = str(getattr(timed_observation, "trace_id", "") or trace_id)
@@ -295,7 +457,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         timed_observation.server_receive_ms = (decoded_at - handler_start) * 1000
         timed_observation.server_queue_enter_perf = decoded_at
         self.logger.info(
-            "SERVER TRACE trace_id=%s event=SERVER_OBSERVATION_DECODED perf_s=%.6f "
+            "服务端追踪：观测数据解码完成 trace_id=%s event=SERVER_OBSERVATION_DECODED perf_s=%.6f "
             "server_receive_ms=%.3f",
             trace_id,
             decoded_at,
@@ -359,6 +521,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
             )
 
+            if getattr(obs, "request_kind", "action") == "next_subtask":
+                payload = self._predict_subtask_response(obs)
+                context.set_trailing_metadata(
+                    (("x-lerobot-trace-id", str(getattr(obs, "request_id", trace_id))),)
+                )
+                return services_pb2.Actions(data=pickle.dumps(payload))  # nosec
+
             with self._predicted_timesteps_lock:
                 self._predicted_timesteps.add(obs.get_timestep())
 
@@ -369,13 +538,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 infer_at,
             )
             action_chunk, stage_timing = self._predict_action_chunk(obs)
+            action_chunk.update(self._response_context(obs, "action_chunk"))
             infer_done = time.perf_counter()
             inference_time = infer_done - infer_at
             self.logger.info(
-                "SERVER TRACE trace_id=%s event=SERVER_INFER_END perf_s=%.6f "
-                "server_model_infer_ms=%.3f prefix_frames_used=%d inference_delay_frames=%d",
+                "服务端追踪：本次推理完成 trace_id=%s event=SERVER_INFER_END perf_s=%.6f "
+                "本次模型推理耗时=%.3f毫秒 server_model_infer_ms=%.3f "
+                "prefix_frames_used=%d inference_delay_frames=%d",
                 trace_id,
                 infer_done,
+                stage_timing["server_model_infer_ms"],
                 stage_timing["server_model_infer_ms"],
                 action_chunk["prefix_frames_used"],
                 action_chunk["inference_delay_frames"],
@@ -506,7 +678,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         inference_delay: int = 0,
     ) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
-        if self.policy_type == "pi05" and self.rtc_config.enabled and prev_chunk_left_over is not None:
+        if (
+            self.policy_type in {"pi05", "fineart_vla"}
+            and self.rtc_config.enabled
+            and prev_chunk_left_over is not None
+        ):
             chunk = self.policy.predict_action_chunk(
                 observation,
                 inference_delay=inference_delay,
@@ -537,7 +713,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     ) -> tuple[torch.Tensor | None, int]:
         """Convert the observation-aligned client action prefix to Pi0.5 model space."""
         previous_actions = getattr(observation_t, "previous_actions", None)
-        if previous_actions is None or self.policy_type != "pi05" or not self.rtc_config.enabled:
+        if (
+            previous_actions is None
+            or self.policy_type not in {"pi05", "fineart_vla"}
+            or not self.rtc_config.enabled
+        ):
             return None, 0
 
         prefix_absolute = torch.as_tensor(previous_actions, dtype=torch.float32)
@@ -579,6 +759,69 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         return prefix_model, prefix_frames_used
 
+    def _response_context(self, observation_t: TimedObservation, response_kind: str) -> dict[str, Any]:
+        return {
+            "protocol_version": self.config.protocol_version,
+            "response_kind": response_kind,
+            "session_id": str(getattr(observation_t, "session_id", "")),
+            "request_id": str(getattr(observation_t, "request_id", "")),
+            "query_id": str(getattr(observation_t, "query_id", "")),
+            "subtask_epoch": int(getattr(observation_t, "subtask_epoch", 0)),
+            "profile": str(getattr(observation_t, "profile", "")),
+            "checkpoint_fingerprint": str(
+                getattr(observation_t, "checkpoint_fingerprint", "")
+            ),
+            "server_instance_id": self.server_instance_id,
+            "control_step": int(getattr(observation_t, "control_step", 0)),
+            "trajectory_step": int(getattr(observation_t, "trajectory_step", 0)),
+            "stage_step": int(getattr(observation_t, "stage_step", 0)),
+            "observation_timestamp_ns": int(
+                getattr(observation_t, "observation_timestamp_ns", 0)
+            ),
+        }
+
+    def _predict_subtask_response(self, observation_t: TimedObservation) -> dict[str, Any]:
+        if self.policy_type != "fineart_vla" or self.language_preprocessor is None:
+            raise RuntimeError("Text queries require a loaded fineart_vla checkpoint")
+        if not self.policy.supports_text_generation():
+            raise RuntimeError("The loaded checkpoint does not support text generation")
+        raw = observation_t.get_observation()
+        observation = raw_observation_to_observation(
+            raw,
+            self.lerobot_features,
+            self.transport_image_features,
+        )
+        observation[QUERY_KIND] = "next_subtask"
+        observation[QUERY_TEXT] = str(
+            getattr(observation_t, "query_text", "Describe the next subtask.")
+        )
+        allowed_subtasks = list(getattr(observation_t, "allowed_subtasks", []))
+        if not allowed_subtasks or any(
+            not isinstance(candidate, str) or not candidate.strip()
+            for candidate in allowed_subtasks
+        ):
+            raise ValueError("next_subtask requires a non-empty allowed_subtasks list")
+        processed = self.language_preprocessor(observation)
+        with torch.inference_mode():
+            generated_text = self.policy.generate_text(
+                processed,
+                allowed_subtasks=allowed_subtasks,
+            )
+        if not isinstance(generated_text, str) or not generated_text.strip():
+            raise ValueError("FineART text head returned an empty response")
+        if len(generated_text) > 4096:
+            raise ValueError("FineART text response exceeds 4096 characters")
+        if generated_text not in allowed_subtasks:
+            raise ValueError("FineART constrained text head returned a subtask outside the allowlist")
+        response = self._response_context(observation_t, "subtask_query")
+        response.update(
+            {
+                "generated_text": generated_text,
+                "allowed_subtasks": allowed_subtasks,
+            }
+        )
+        return response
+
     def _predict_action_chunk(self, observation_t: TimedObservation) -> tuple[dict[str, Any], dict[str, float]]:
         """Predict an action chunk based on an observation.
 
@@ -594,7 +837,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
-            self.policy_image_features,
+            self.transport_image_features,
         )
         prepare_time = time.perf_counter() - start_prepare
 
@@ -621,16 +864,48 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         elapsed_before_inference = max(0.0, time.perf_counter() - request_start_perf)
         predicted_remaining_latency = self.rtc_latency_tracker.max() or 0.0
         request_fps = float(getattr(observation_t, "fps", 0.0) or self.config.fps)
-        guidance_delay_frames = math.ceil(
+        predicted_delay_frames = math.ceil(
             (elapsed_before_inference + predicted_remaining_latency) * request_fps
         )
+        guidance_delay_frames = predicted_delay_frames
+        conditioned_delay_frames = predicted_delay_frames
+        if self.rtc_config.mode == "trained" and rtc_prefix is not None:
+            training_max_delay = int(self.policy.config.rtc_training_max_delay)
+            conditioned_delay_frames = _conditioned_rtc_delay_frames(
+                predicted_delay_frames,
+                int(self.rtc_config.delay_safety_margin_frames),
+                training_max_delay,
+                prefix_frames_used,
+            )
+            guidance_delay_frames = conditioned_delay_frames
+            if conditioned_delay_frames < (
+                predicted_delay_frames + int(self.rtc_config.delay_safety_margin_frames)
+            ):
+                self.logger.warning(
+                    "Clamped trained RTC delay from %d to %d frames "
+                    "(margin=%d, checkpoint max=%d, available=%d)",
+                    predicted_delay_frames,
+                    conditioned_delay_frames,
+                    self.rtc_config.delay_safety_margin_frames,
+                    training_max_delay,
+                    prefix_frames_used,
+                )
+            self.logger.info(
+                "Trained RTC delay prediction: predicted=%d margin=%d "
+                "conditioned=%d prefix=%d checkpoint_max=%d",
+                predicted_delay_frames,
+                self.rtc_config.delay_safety_margin_frames,
+                conditioned_delay_frames,
+                prefix_frames_used,
+                training_max_delay,
+            )
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(
             observation,
             prev_chunk_left_over=rtc_prefix,
-            inference_delay=guidance_delay_frames,
+            inference_delay=conditioned_delay_frames,
         )
         # torch.compile CUDA graph replay is async — synchronize so inference timing
         # captures real GPU execution time and postprocessing timing is not inflated.
@@ -638,7 +913,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             torch.cuda.synchronize()
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
-            f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
+            "本次模型推理耗时：%.3f 毫秒，动作张量形状：%s",
+            inference_time * 1000,
+            tuple(action_tensor.shape),
         )
 
         """4. Apply postprocessor"""
@@ -678,12 +955,39 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         actual_delay_frames = math.ceil(
             max(0.0, postprocess_stops - request_start_perf) * request_fps
         )
+        rejection_reason = _rtc_delay_rejection_reason(
+            trained_with_prefix=(
+                self.rtc_config.mode == "trained" and rtc_prefix is not None
+            ),
+            actual_delay_frames=actual_delay_frames,
+            conditioned_delay_frames=conditioned_delay_frames,
+        )
+        response_status = "rtc_rejected" if rejection_reason else "ok"
+        if rejection_reason:
+            action_chunk = []
+            self.logger.error(
+                "Rejecting trained RTC chunk without breaking the client stream: "
+                "actual_delay=%d conditioned_delay=%d predicted_delay=%d "
+                "prefix=%d checkpoint_max=%d",
+                actual_delay_frames,
+                conditioned_delay_frames,
+                predicted_delay_frames,
+                prefix_frames_used,
+                self.policy.config.rtc_training_max_delay,
+            )
         response = {
+            "response_status": response_status,
+            "rejection_reason": rejection_reason,
             "trace_id": str(getattr(observation_t, "trace_id", "")),
             "observation_timestep": observation_t.get_timestep(),
             "inference_delay_frames": actual_delay_frames,
-            "guidance_delay_frames": guidance_delay_frames,
+            "predicted_delay_frames": predicted_delay_frames,
+            "conditioned_delay_frames": conditioned_delay_frames,
+            "guidance_delay_frames": conditioned_delay_frames,
             "prefix_frames_used": prefix_frames_used,
+            "rtc_training_max_delay": int(
+                getattr(self.policy.config, "rtc_training_max_delay", 0)
+            ),
             "expired_prefix_frames": 0,
             "previous_action_start_index": int(
                 getattr(observation_t, "previous_action_start_index", 0)
@@ -725,9 +1029,30 @@ def serve(cfg: PolicyServerConfig):
         ],
     )
     services_pb2_grpc.add_AsyncInferenceServicer_to_server(policy_server, server)
-    server.add_insecure_port(f"{cfg.host}:{cfg.port}")
+    bind_address = f"{cfg.host}:{cfg.port}"
+    if cfg.require_mtls:
+        server_credentials = grpc.ssl_server_credentials(
+            private_key_certificate_chain_pairs=(
+                (
+                    Path(cfg.tls_server_key_path).read_bytes(),
+                    Path(cfg.tls_server_cert_path).read_bytes(),
+                ),
+            ),
+            root_certificates=Path(cfg.tls_ca_cert_path).read_bytes(),
+            require_client_auth=True,
+        )
+        bound_port = server.add_secure_port(bind_address, server_credentials)
+    else:
+        bound_port = server.add_insecure_port(bind_address)
+    if bound_port == 0:
+        raise RuntimeError(f"Failed to bind PolicyServer to {bind_address}")
 
-    policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
+    policy_server.logger.info(
+        "PolicyServer started on %s transport=%s instance=%s",
+        bind_address,
+        "mTLS" if cfg.require_mtls else "insecure-loopback",
+        policy_server.server_instance_id,
+    )
     server.start()
 
     server.wait_for_termination()

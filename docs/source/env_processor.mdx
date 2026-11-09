@@ -25,8 +25,8 @@ raw_observation = env.step(action)
 # 2. Convert numpy to torch, normalize images [0,1]
 observation = preprocess_observation(raw_observation)
 
-# 3. Add task metadata (for multi-task environments)
-observation = add_envs_task(env, observation)
+# 3. Add the task description (for multi-task environments)
+observation["task"] = list(env.call("task_description"))
 
 # 4. ENVIRONMENT-SPECIFIC preprocessing (NEW!)
 #    - Flatten robot states
@@ -88,20 +88,6 @@ policy_preprocessor = NormalizerProcessorStep(stats=dataset_stats)
 
 The same policy can work with different environment processors, and the same environment processor can work with different policies:
 
-````python
-# Use SmolVLA policy with LIBERO environment
-# Use SmolVLA policy with LIBERO environment
-libero_preprocessor, libero_postprocessor = make_env_pre_post_processors(
-    env_cfg=libero_cfg,
-    policy_cfg=smolvla_cfg,
-)
-smolvla_preprocessor, smolvla_postprocessor = make_pre_post_processors(smolvla_cfg)
-# Or use ACT policy with the same LIBERO environment
-libero_preprocessor, libero_postprocessor = make_env_pre_post_processors(
-    env_cfg=libero_cfg,
-    policy_cfg=act_cfg,
-)
-act_preprocessor, act_postprocessor = make_pre_post_processors(act_cfg)
 ```python
 # Use SmolVLA policy with LIBERO environment
 libero_preprocessor, libero_postprocessor = make_env_pre_post_processors(
@@ -116,6 +102,7 @@ libero_preprocessor, libero_postprocessor = make_env_pre_post_processors(
     policy_cfg=act_cfg,
 )
 act_preprocessor, act_postprocessor = make_pre_post_processors(act_cfg)
+```
 
 ### 3. **Easier Experimentation**
 
@@ -145,7 +132,7 @@ class LiberoVelocityProcessorStep(ObservationProcessorStep):
         state = torch.cat([eef_pos, eef_axisangle, eef_vel,
                           gripper_pos, gripper_vel], dim=-1)  # 14D
         return state
-````
+```
 
 ### 4. **Cleaner Environment Code**
 
@@ -176,13 +163,16 @@ The `make_env_pre_post_processors` function follows the same pattern as `make_pr
 from lerobot.envs import make_env_pre_post_processors, PushtEnv
 from lerobot.envs.configs import LiberoEnv
 
+# policy_cfg is your policy's config (e.g. cfg.policy in lerobot-eval); a few policies,
+# such as XVLA, provide their own environment processors
+
 # For LIBERO: Returns LiberoProcessorStep in preprocessor
-libero_cfg = LiberoEnv(task="libero_spatial", camera_name=["agentview"])
-env_preprocessor, env_postprocessor = make_env_pre_post_processors(libero_cfg)
+libero_cfg = LiberoEnv(task="libero_spatial")
+env_preprocessor, env_postprocessor = make_env_pre_post_processors(libero_cfg, policy_cfg=policy_cfg)
 
 # For other environments: Returns identity processors (no-op)
 pusht_cfg = PushtEnv()
-env_preprocessor, env_postprocessor = make_env_pre_post_processors(pusht_cfg)
+env_preprocessor, env_postprocessor = make_env_pre_post_processors(pusht_cfg, policy_cfg=policy_cfg)
 ```
 
 ### Implementation in `envs/factory.py`
@@ -238,7 +228,7 @@ def eval_main(cfg: EvalPipelineConfig):
     )
 
     # Create environment processors (NEW!)
-    env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env)
+    env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
     # Run evaluation with both processor types
     eval_policy_all(

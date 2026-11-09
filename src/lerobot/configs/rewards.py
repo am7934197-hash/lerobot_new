@@ -56,6 +56,8 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     device: str | None = None
 
     pretrained_path: str | None = None
+    # Optional Hub revision (commit hash, branch, or tag) to pin the pretrained reward model version.
+    pretrained_revision: str | None = None
 
     push_to_hub: bool = False
     repo_id: str | None = None
@@ -79,15 +81,15 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         return choice_name
 
     @property
-    def observation_delta_indices(self) -> list | None:  # type: ignore[type-arg]
+    def observation_delta_indices(self) -> list[int] | None:
         return None
 
     @property
-    def action_delta_indices(self) -> list | None:  # type: ignore[type-arg]
+    def action_delta_indices(self) -> list[int] | None:
         return None
 
     @property
-    def reward_delta_indices(self) -> list | None:  # type: ignore[type-arg]
+    def reward_delta_indices(self) -> list[int] | None:
         return None
 
     def get_optimizer_preset(self) -> OptimizerConfig | None:
@@ -101,8 +103,10 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         pass
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+        # Encode against the base class so draccus includes the choice "type" key,
+        # which `from_pretrained` needs to resolve the concrete subclass.
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(draccus.encode(self, RewardModelConfig), f, indent=4)
 
     @classmethod
     def from_pretrained(
@@ -161,4 +165,12 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
 
         cli_overrides = reward_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            config = draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+
+        # Same backfill as PreTrainedConfig.from_pretrained: config.json does not
+        # carry the source path, and direct callers (PreTrainedRewardModel,
+        # make_reward_model) branch on pretrained_path — e.g. RobometerRewardModel
+        # would take its "fresh model" branch instead of loading the checkpoint.
+        config.pretrained_path = model_id
+        config.pretrained_revision = revision
+        return config

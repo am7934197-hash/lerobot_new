@@ -14,6 +14,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -54,6 +55,14 @@ class PolicyServerConfig:
     # Networking configuration
     host: str = field(default="localhost", metadata={"help": "Host address to bind the server to"})
     port: int = field(default=8080, metadata={"help": "Port number to bind the server to"})
+    protocol_version: int = 1
+    expected_policy_type: str = ""
+    expected_checkpoint_path: str = ""
+    expected_checkpoint_fingerprint: str = ""
+    require_mtls: bool = False
+    tls_ca_cert_path: str = ""
+    tls_server_cert_path: str = ""
+    tls_server_key_path: str = ""
 
     # Timing configuration
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
@@ -82,6 +91,21 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+        if self.protocol_version != 1:
+            raise ValueError("Only protocol_version=1 is supported")
+        if self.require_mtls:
+            for name in (
+                "tls_ca_cert_path",
+                "tls_server_cert_path",
+                "tls_server_key_path",
+            ):
+                path = Path(getattr(self, name)).expanduser()
+                if not path.is_file():
+                    raise FileNotFoundError(f"mTLS file does not exist: {path}")
+        elif self.host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::"}:
+            # 0.0.0.0/:: 已加入白名单（内网联调用）：
+            # 允许明文 gRPC 绑定全部网卡；跨机部署请优先启用 mTLS。
+            pass
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":

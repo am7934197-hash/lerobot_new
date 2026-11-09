@@ -1,86 +1,201 @@
-# LeRobot（Galbot PI05 喷涂版）
+<p align="center">
+  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
+</p>
 
-基于 [HuggingFace LeRobot](https://github.com/huggingface/lerobot) 的定制版本，用于 **Galbot G1 机器人 PI05（Pi0.5）喷涂任务**：数据转换 → 模型训练 → gRPC 部署。
+<div align="center">
 
-> 当前分支 `swanlab`，基于官方 `main` 分支（VLA-JEPA）定制。
+[![Tests](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml?query=branch%3Amain)
+[![Tests](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml?query=branch%3Amain)
+[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
+[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
+[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
+[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/s3KuuzsPFb)
 
-## 相对官方 main 的主要修改
+</div>
 
-| 修改点 | 位置 | 说明 |
-|--------|------|------|
-| **SwanLab 日志支持** | `src/lerobot/common/wandb_utils.py` | 日志后端可选 `wandb` / `swanlab`（配置 `wandb.backend: swanlab`） |
-| **Delta Action（相对动作）训练** | `src/lerobot/processor/relative_action_processor.py` | 训练时 `action -= state` 预测相对偏移，推理时加回 state；支持 `use_relative_actions` 配置 |
-| **PolicyServer 推理优化** | `src/lerobot/async_inference/policy_server.py` | postprocess 由逐帧循环改为整块批量处理；推理耗时加 `cuda.synchronize` 保证计时准确 |
-| **观测图片 key 过滤** | `src/lerobot/async_inference/helpers.py` | 只保留策略需要的图片 key，多余相机不再报错 |
-| **数据集统计量脚本** | `src/lerobot/scripts/augment_dataset_quantile_stats.py` | 新增 `--push-to-hub` 参数，默认只改本地 |
-| **数据转换工具** | `tests/my_test/dataset_create/` | mcap → LeRobot v3 格式（含里程计、多任务合并、断点续传），详见其 `readme.md` |
-| **PI05 训练脚本与配置** | `tests/my_test/pi05_training/` | 完整训练流程，详见其 `README.md` |
-| **SwanLab 集成测试** | `tests/swanlab/` | 后端联调测试 |
-| 安装说明 | `install.md` | 依赖安装命令 |
+**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
 
-## 环境安装（PI05 训练）
+🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
 
-```bash
-conda create -n lerobot python=3.12 -y
-conda activate lerobot
+🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
 
-# 安装 lerobot 本体及训练/推理/pi05 依赖（国内可用阿里云镜像）
-pip install -e . -i https://mirrors.aliyun.com/pypi/simple/
-pip install -e ".[training]" -i https://mirrors.aliyun.com/pypi/simple/
-pip install -e ".[async]" -i https://mirrors.aliyun.com/pypi/simple/
-pip install -e .[pi] -i https://mirrors.aliyun.com/pypi/simple/
-pip install -e .[dataset] -i https://mirrors.aliyun.com/pypi/simple/
+🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
 
-# 训练日志后端
-pip install swanlab
-```
+🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
 
-## 模型训练（tests/my_test/pi05_training）
+## Quick Start
+
+LeRobot can be installed directly from PyPI.
 
 ```bash
-conda activate lerobot
-cd tests/my_test/pi05_training
-
-# 离线环境（模型/数据已本地缓存）
-export HF_ENDPOINT=https://hf-mirror.com
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
+pip install lerobot
+lerobot-info
 ```
 
-训练前需把配置文件里的 `dataset.root` 指向本地数据集（mcap 数据需先用 `tests/my_test/dataset_create/` 工具转换）。
+The base install is lightweight. Add the extras you need, for example `pip install 'lerobot[dataset]'` to load datasets, `'lerobot[training]'` to train policies, or `'lerobot[core_scripts,feetech]'` to record with an SO-101 arm.
+
+> [!IMPORTANT]
+> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+
+## Robots & Control
+
+<div align="center">
+  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
+</div>
+
+LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
+
+```python
+from lerobot.robots.myrobot import MyRobot
+
+# Connect to a robot
+robot = MyRobot(config=...)
+robot.connect()
+
+# Read observation and send action
+obs = robot.get_observation()
+action = model.select_action(obs)
+robot.send_action(action)
+```
+
+**Supported Hardware:** SO101, OpenARM, LeKiwi, Unitree G1, reBot B601, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones and more.
+
+While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
+
+For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
+
+## LeRobot Dataset
+
+To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
+
+- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
+- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
+- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
+
+```python
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+# Load a dataset from the Hub
+dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
+
+# Access data (automatically handles video decoding)
+episode_index=0
+print(f"{dataset[episode_index]['action'].shape=}\n")
+```
+
+Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3).
+
+## SoTA Models
+
+LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, Vision-Language-Action (VLA) models, World Models, and Reward Models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
+
+<p align="center">
+  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
+</p>
+
+Training a policy is as simple as running a script configuration:
 
 ```bash
-# 绝对动作训练（4 摄像头）
-bash pi05_train_accelerate.sh
-
-# Delta Action 训练（相对动作，推荐，收敛更快）
-bash pi05_train_accelerate_deltaaction.sh
-
-# 3 摄像头 / 其他变体
-bash pi05_train_accelerate_3cam_delta.sh
-
-# 覆盖参数
-NUM_PROCESSES=4 bash pi05_train_accelerate.sh   # 4 卡训练
+lerobot-train \
+  --policy.type=act \
+  --dataset.repo_id=lerobot/aloha_mobile_cabinet \
+  --policy.push_to_hub=false
 ```
 
-- 训练日志通过 **SwanLab** 记录（项目名 `lerobot-pi05-painting`，需设置 `SWANLAB_API_KEY`）
-- 训练输出：`tests/my_test/pi05_training/outputs/train/<日期>/<时间>_<job_name>/`
-- 部署用 checkpoint：`.../checkpoints/last/pretrained_model`
-- Delta Action 训练前建议先跑 `recompute_relative_stats.py` 重算数据集统计量
+| Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md)                                                                                                                                                                                                                                                                                                                                                      |
+| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **VLAs Models**            | [Pi0](./docs/source/pi0.mdx), [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [FineART-VLA](./docs/source/fineart_vla.mdx), [GR00T N1.7](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx), [EO-1](./docs/source/eo1.mdx), [MolmoAct2](./docs/source/molmoact2.mdx), [LingBot-VLA 2.0](./docs/source/lingbot_vla_v2.mdx), [WALL-OSS](./docs/source/walloss.mdx), [Wall-OSS-0.5](./docs/source/wall_oss_05.mdx), [EVO1](./docs/source/evo1.mdx), [DM05](./docs/source/dm05.mdx) |
+| **World Models**           | [VLA-JEPA](./docs/source/vla_jepa.mdx), [LingBot-VA](./docs/source/lingbot_va.mdx), [FastWAM](./docs/source/fastwam.mdx), [LaWAM](./docs/source/lawam.mdx), [FLUX 3 Action](./docs/source/flux3.mdx)                                                                                                                                                                                                                                                                                                                                                                         |
+| **Reward Models**          | [SARM](./docs/source/sarm.mdx), [TOPReward](./docs/source/topreward.mdx), [Robometer](./docs/source/robometer.mdx)                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
-## 模型部署（gRPC PolicyServer）
+Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub.
+
+For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies). For GPU/RAM requirements and expected training time per policy, see the [Compute Hardware Guide](https://huggingface.co/docs/lerobot/hardware_guide).
+
+## Inference & Evaluation
+
+Evaluate your policies in simulation with `lerobot-eval`. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come. To run a trained policy on a real robot, use `lerobot-rollout` (see the [Policy Deployment Documentation](https://huggingface.co/docs/lerobot/inference)).
 
 ```bash
-conda activate lerobot
-# 远端 GPU 服务器启动 PolicyServer
-python -m lerobot.async_inference.policy_server --host=0.0.0.0 --port=18006 --fps=30
+# Evaluate a policy on the LIBERO benchmark
+lerobot-eval \
+  --policy.path=lerobot/pi0_libero_finetuned \
+  --env.type=libero \
+  --env.task=libero_object \
+  --eval.n_episodes=10
 ```
 
-然后配置机器人端 `galbot_vla_client/vla_config.yaml`：
+Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub).
 
-```yaml
-policy_server_address: "<远端服务器IP>:18006"   # 指向 PolicyServer
-pretrained_name_or_path: "/mnt/data1/jizheng/vla_project/lerobot/tests/my_test/pi05_training/outputs/train/<日期>/<时间>_<job>/checkpoints/last/pretrained_model"
+### Third-Party Hardware
+
+Beyond the natively supported hardware, the community maintains a growing ecosystem of plugins for other robots, teleoperators, cameras, and sensors - UFACTORY xArm, Universal Robots UR5e, Franka, AgileX Piper, Trossen WidowX, ARX5, I2RT YAM, GELLO, SpaceMouse, Meta Quest, ROS 2 bridges, tactile and depth cameras, and more.
+
+Plugins are auto-discovered by package name: LeRobot imports any installed package prefixed with `lerobot_robot_`, `lerobot_teleoperator_`, or `lerobot_camera_`. Install one and use the `type` it registers straight from the CLI:
+
+```bash
+pip install lerobot_robot_<name> lerobot_teleoperator_<name>
+
+lerobot-record \
+  --robot.type=<robot_name> \
+  --teleop.type=<teleoperator_name> \
+  --dataset.repo_id=${HF_USER}/my-dataset
 ```
 
-启动机器人端 `python server.py` 后，即可通过 HTTP 接口下发文字指令执行 VLA 推理。
+Browse the full list in the [Third-Party Robots & Teleoperators](https://huggingface.co/docs/lerobot/main/third_party_robots) and [Third-Party Cameras & Sensors](https://huggingface.co/docs/lerobot/main/third_party_sensors) documentation.
+
+## Resources
+
+- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
+- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
+- **[Discord](https://discord.gg/s3KuuzsPFb):** Join the `LeRobot` server to discuss with the community.
+- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
+- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+- **[T-Shirt Folding Experiment](https://huggingface.co/spaces/lerobot/robot-folding):** An end-to-end demonstration of folding t-shirts with LeRobot.
+- **[LeLab](https://github.com/huggingface/leLab):** A web interface for LeRobot — teleoperate, calibrate, record datasets, replay, and train your SO arm from the browser, no CLI required.
+
+## Citation
+
+If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
+
+```bibtex
+@misc{cadene2024lerobot,
+    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Meftah, Khalil and Ellerbach, Maxime and Moss, Jess and Wolf, Thomas},
+    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
+    howpublished = "\url{https://github.com/huggingface/lerobot}",
+    year = {2024}
+}
+```
+
+If you are referencing our research or the academic paper, please also cite our ICLR publication:
+
+<details>
+<summary><b>ICLR 2026 Paper</b></summary>
+
+```bibtex
+@inproceedings{cadenelerobot,
+  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
+  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
+  booktitle={The Fourteenth International Conference on Learning Representations},
+  year={2026},
+  url={https://arxiv.org/abs/2602.22818}
+}
+```
+
+</details>
+
+## Contribute
+
+We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+
+<p align="center">
+  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
+</p>
+
+<div align="center">
+<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
+</div>

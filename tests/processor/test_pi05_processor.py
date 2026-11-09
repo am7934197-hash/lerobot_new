@@ -26,11 +26,7 @@ pytest.importorskip("transformers")
 from lerobot.configs import FeatureType, PolicyFeature  # noqa: E402
 from lerobot.policies.pi05 import PI05Policy  # noqa: E402
 from lerobot.policies.pi05.configuration_pi05 import PI05Config  # noqa: E402
-from lerobot.policies.pi05.processor_pi05 import (  # noqa: E402
-    Pi05PrepareStateTokenizerProcessorStep,
-    make_pi05_pre_post_processors,
-)
-from lerobot.types import TransitionKey  # noqa: E402
+from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
 from tests.policies.pi0_pi05.utils.openpi_parity import (  # noqa: E402
     IMAGE_KEYS,
@@ -123,31 +119,6 @@ def create_dummy_data() -> dict:
         },
         "task": [prompt for _ in range(batch_size)],
     }
-
-
-def test_state_dropout_only_applies_to_supervised_training_samples():
-    step = Pi05PrepareStateTokenizerProcessorStep(state_dropout_prob=1.0)
-    observation = {OBS_STATE: torch.zeros(2, DUMMY_STATE_DIM)}
-    complementary_data = {"task": ["pick_object", "place_object"]}
-
-    training_transition = {
-        TransitionKey.OBSERVATION: observation,
-        TransitionKey.ACTION: torch.zeros(2, DUMMY_ACTION_HORIZON, DUMMY_ACTION_DIM),
-        TransitionKey.COMPLEMENTARY_DATA: {**complementary_data},
-    }
-    training_output = step(training_transition)
-    assert training_output[TransitionKey.COMPLEMENTARY_DATA]["task"] == [
-        "Task: pick object;\nAction: ",
-        "Task: place object;\nAction: ",
-    ]
-
-    inference_transition = {
-        TransitionKey.OBSERVATION: observation,
-        TransitionKey.ACTION: None,
-        TransitionKey.COMPLEMENTARY_DATA: {**complementary_data},
-    }
-    inference_output = step(inference_transition)
-    assert all(", State: " in prompt for prompt in inference_output[TransitionKey.COMPLEMENTARY_DATA]["task"])
 
 
 def test_pi05_processor_inputs_match_openpi_reference():
